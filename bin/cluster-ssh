@@ -1,0 +1,902 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+VERSION="2.0.0"
+CONFIG_FILE="${CLUSTER_SSH_CONFIG:-/etc/cluster-ssh/config.sh}"
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "[ERROR] Config file not found: $CONFIG_FILE" >&2
+  echo "        Set CLUSTER_SSH_CONFIG to the correct config path." >&2
+  exit 1
+fi
+
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+: "${CLUSTER_SSH_USER:=vmware-system-user}"
+: "${KUBECTL_BIN:=kubectl}"
+: "${SSH_BIN:=ssh}"
+: "${CLUSTER_DISCOVERY_MODE:=static}"
+: "${SUPERVISOR_CLUSTER_RESOURCE:=clusters.cluster.x-k8s.io}"
+: "${KUBECTL_REQUEST_TIMEOUT:=5s}"
+: "${NODE_CACHE_TTL:=20}"
+: "${CLUSTER_CACHE_TTL:=30}"
+: "${ASSET_CACHE_TTL:=300}"
+: "${KUBECONFIG_SECRET_SUFFIX:=-kubeconfig}"
+: "${KUBECONFIG_SECRET_KEY:=value}"
+: "${SSH_SECRET_SUFFIX:=-ssh}"
+: "${SSH_SECRET_KEY:=ssh-privatekey}"
+: "${CLUSTER_SSH_CACHE_DIR:=${XDG_CACHE_HOME:-$HOME/.cache}/cluster-ssh}"
+: "${CLUSTER_SSH_KNOWN_HOSTS:=${XDG_STATE_HOME:-$HOME/.local/state}/cluster-ssh/known_hosts}"
+
+if ! declare -p CLUSTER_SSH_OPTS >/dev/null 2>&1; then
+  CLUSTER_SSH_OPTS=(
+    -o IdentitiesOnly=yes
+    -o PreferredAuthentications=publickey
+    -o PasswordAuthentication=no
+    -o StrictHostKeyChecking=accept-new
+    -o ConnectTimeout=5
+  )
+fi
+
+mkdir -p "$CLUSTER_SSH_CACHE_DIR/nodes" "$CLUSTER_SSH_CACHE_DIR/assets"
+mkdir -p "$(dirname "$CLUSTER_SSH_KNOWN_HOSTS")"
+chmod 700 "$CLUSTER_SSH_CACHE_DIR" "$CLUSTER_SSH_CACHE_DIR/nodes" "$CLUSTER_SSH_CACHE_DIR/assets" 2>/dev/null || true
+touch "$CLUSTER_SSH_KNOWN_HOSTS"
+chmod 600 "$CLUSTER_SSH_KNOWN_HOSTS" 2>/dev/null || true
+
+RUNTIME_DIR=""
+CLUSTER_SOURCE=""
+CLUSTER_REF=""
+CLUSTER_NAMESPACE=""
+CLUSTER_NAME=""
+KUBECONFIG_PATH=""
+PRIVATE_KEY_PATH=""
+NODE_ROWS=()
+
+cleanup() {
+  if [[ -n "$RUNTIME_DIR" && -d "$RUNTIME_DIR" ]]; then
+    rm -rf "$RUNTIME_DIR"
+  fi
+}
+trap cleanup EXIT
+
+log_info()  { printf '[INFO] %s\n' "$*" >&2; }
+log_warn()  { printf '[WARN] %s\n' "$*" >&2; }
+log_error() { printf '[ERROR] %s\n' "$*" >&2; }
+
+show_usage() {
+  cat <<'EOF_USAGE'
+Usage:
+  cluster-ssh list
+  cluster-ssh nodes <cluster>
+  cluster-ssh <cluster>
+  cluster-ssh <cluster> <node-name|node-ip|index>
+  cluster-ssh check <cluster> <node-name|node-ip|index>
+  cluster-ssh exec <cluster> <node-name|node-ip|index> -- '<remote command>'
+  cluster-ssh doctor <cluster> <node-name|node-ip|index> [--output <file>]
+  cluster-ssh egress-check <cluster> <node-name|node-ip|index> \
+      --egress-ip <ip> [--dst <ip>] [--port <port>] [--iface <interface>]
+  cluster-ssh refresh [cluster]
+  cluster-ssh version
+  cluster-ssh help
+
+Cluster formats:
+  static mode      : dev-workload
+  supervisor mode  : namespace/cluster-name
+  alias (optional) : dev-workload -> namespace/cluster-name
+
+Examples:
+  cluster-ssh list
+  cluster-ssh nodes dev-workload
+  cluster-ssh dev-workload
+  cluster-ssh dev-workload worker-node-01
+  cluster-ssh dev-workload 2
+  cluster-ssh exec dev-workload worker-node-01 -- 'sudo journalctl -u kubelet -n 100 --no-pager'
+  cluster-ssh doctor dev-workload worker-node-01
+  cluster-ssh egress-check dev-workload worker-node-01 --egress-ip 10.60.93.191 --dst 10.60.191.31 --port 8522
+EOF_USAGE
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || {
+    log_error "Required command not found: $1"
+    return 1
+  }
+}
+
+mode_has_static() {
+  [[ "$CLUSTER_DISCOVERY_MODE" == "static" || "$CLUSTER_DISCOVERY_MODE" == "hybrid" ]]
+}
+
+mode_has_supervisor() {
+  [[ "$CLUSTER_DISCOVERY_MODE" == "supervisor" || "$CLUSTER_DISCOVERY_MODE" == "hybrid" ]]
+}
+
+safe_cache_name() {
+  printf '%s' "$1" | tr '/: ' '___' | tr -cd '[:alnum:]_.-'
+}
+
+cache_is_fresh() {
+  local file="$1"
+  local ttl="$2"
+  [[ -f "$file" ]] || return 1
+
+  local now mtime
+  now=$(date +%s)
+  mtime=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo 0)
+  (( now - mtime < ttl ))
+}
+
+kubectl_supervisor() {
+  [[ -n "${SUPERVISOR_KUBECONFIG:-}" ]] || {
+    log_error "SUPERVISOR_KUBECONFIG is not configured."
+    return 1
+  }
+  [[ -f "$SUPERVISOR_KUBECONFIG" ]] || {
+    log_error "Supervisor kubeconfig not found: $SUPERVISOR_KUBECONFIG"
+    return 1
+  }
+
+  "$KUBECTL_BIN" \
+    --kubeconfig "$SUPERVISOR_KUBECONFIG" \
+    --request-timeout="$KUBECTL_REQUEST_TIMEOUT" \
+    "$@"
+}
+
+list_static_clusters() {
+  if declare -p CLUSTERS >/dev/null 2>&1; then
+    printf '%s\n' "${CLUSTERS[@]}"
+  fi
+}
+
+fetch_supervisor_clusters() {
+  kubectl_supervisor get "$SUPERVISOR_CLUSTER_RESOURCE" -A \
+    -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+}
+
+list_supervisor_clusters_tsv() {
+  local cache_file="$CLUSTER_SSH_CACHE_DIR/clusters.tsv"
+
+  if cache_is_fresh "$cache_file" "$CLUSTER_CACHE_TTL"; then
+    cat "$cache_file"
+    return 0
+  fi
+
+  local tmp
+  tmp=$(mktemp "$CLUSTER_SSH_CACHE_DIR/.clusters.XXXXXX")
+
+  if fetch_supervisor_clusters >"$tmp" 2>/dev/null; then
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$cache_file"
+    cat "$cache_file"
+    return 0
+  fi
+
+  rm -f "$tmp"
+  if [[ -s "$cache_file" ]]; then
+    log_warn "Supervisor API unavailable; using stale cluster cache."
+    cat "$cache_file"
+    return 0
+  fi
+
+  return 1
+}
+
+list_all_cluster_refs() {
+  {
+    if mode_has_static; then
+      list_static_clusters
+    fi
+    if mode_has_supervisor; then
+      list_supervisor_clusters_tsv 2>/dev/null | cut -f1
+    fi
+    if declare -p CLUSTER_ALIASES >/dev/null 2>&1; then
+      printf '%s\n' "${!CLUSTER_ALIASES[@]}"
+    fi
+  } | sed '/^$/d' | sort -u
+}
+
+print_cluster_list() {
+  printf '%-36s %-12s %-8s %s\n' "CLUSTER" "SOURCE" "READY" "PHASE"
+  printf '%-36s %-12s %-8s %s\n' "-------" "------" "-----" "-----"
+
+  if mode_has_static; then
+    local c
+    while IFS= read -r c; do
+      [[ -n "$c" ]] && printf '%-36s %-12s %-8s %s\n' "$c" "static" "-" "-"
+    done < <(list_static_clusters)
+  fi
+
+  if mode_has_supervisor; then
+    local ref phase ready
+    while IFS=$'\t' read -r ref phase ready; do
+      [[ -n "$ref" ]] || continue
+      printf '%-36s %-12s %-8s %s\n' "$ref" "supervisor" "${ready:--}" "${phase:--}"
+    done < <(list_supervisor_clusters_tsv)
+  fi
+
+  if declare -p CLUSTER_ALIASES >/dev/null 2>&1 && ((${#CLUSTER_ALIASES[@]} > 0)); then
+    echo
+    echo "Aliases:"
+    local alias
+    for alias in "${!CLUSTER_ALIASES[@]}"; do
+      printf '  %-24s -> %s\n' "$alias" "${CLUSTER_ALIASES[$alias]}"
+    done | sort
+  fi
+}
+
+resolve_alias() {
+  local input="$1"
+  if declare -p CLUSTER_ALIASES >/dev/null 2>&1 && [[ -n "${CLUSTER_ALIASES[$input]+x}" ]]; then
+    printf '%s\n' "${CLUSTER_ALIASES[$input]}"
+  else
+    printf '%s\n' "$input"
+  fi
+}
+
+static_cluster_exists() {
+  local cluster="$1"
+  declare -F get_cluster_kubeconfig >/dev/null 2>&1 || return 1
+  get_cluster_kubeconfig "$cluster" >/dev/null 2>&1
+}
+
+resolve_supervisor_ref() {
+  local input="$1"
+
+  if [[ "$input" == */* ]]; then
+    local matches
+    matches=$(list_supervisor_clusters_tsv | cut -f1 | grep -Fx "$input" || true)
+    [[ -n "$matches" ]] || {
+      log_error "Supervisor cluster not found: $input"
+      return 1
+    }
+    printf '%s\n' "$input"
+    return 0
+  fi
+
+  local matches=()
+  mapfile -t matches < <(list_supervisor_clusters_tsv | cut -f1 | awk -F/ -v name="$input" '$2 == name')
+
+  if ((${#matches[@]} == 1)); then
+    printf '%s\n' "${matches[0]}"
+    return 0
+  fi
+
+  if ((${#matches[@]} == 0)); then
+    log_error "Supervisor cluster not found: $input"
+  else
+    log_error "Cluster name is ambiguous: $input"
+    printf '        Use namespace/cluster-name. Candidates:\n' >&2
+    printf '        - %s\n' "${matches[@]}" >&2
+  fi
+  return 1
+}
+
+resolve_cluster() {
+  local input
+  input=$(resolve_alias "$1")
+
+  if mode_has_static && static_cluster_exists "$input"; then
+    CLUSTER_SOURCE="static"
+    CLUSTER_REF="$input"
+    CLUSTER_NAME="$input"
+    CLUSTER_NAMESPACE=""
+    return 0
+  fi
+
+  if mode_has_supervisor; then
+    CLUSTER_REF=$(resolve_supervisor_ref "$input") || return 1
+    CLUSTER_SOURCE="supervisor"
+    CLUSTER_NAMESPACE="${CLUSTER_REF%%/*}"
+    CLUSTER_NAME="${CLUSTER_REF#*/}"
+    return 0
+  fi
+
+  log_error "Unsupported cluster: $1"
+  return 1
+}
+
+extract_secret_to_file() {
+  local namespace="$1"
+  local secret_name="$2"
+  local data_key="$3"
+  local destination="$4"
+
+  local encoded tmp
+  encoded=$(kubectl_supervisor -n "$namespace" get secret "$secret_name" \
+    -o go-template="{{index .data \"$data_key\"}}") || return 1
+
+  [[ -n "$encoded" && "$encoded" != "<no value>" ]] || {
+    log_error "Secret key not found: ${namespace}/${secret_name} data.${data_key}"
+    return 1
+  }
+
+  tmp=$(mktemp "${destination}.tmp.XXXXXX")
+  umask 077
+  if ! printf '%s' "$encoded" | base64 --decode >"$tmp" 2>/dev/null; then
+    printf '%s' "$encoded" | base64 -d >"$tmp"
+  fi
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$destination"
+}
+
+resolve_cluster_kubeconfig() {
+  local requested="$1"
+  resolve_cluster "$requested"
+
+  if [[ "$CLUSTER_SOURCE" == "static" ]]; then
+    KUBECONFIG_PATH=$(get_cluster_kubeconfig "$CLUSTER_REF") || return 1
+    [[ -f "$KUBECONFIG_PATH" ]] || {
+      log_error "kubeconfig not found: $KUBECONFIG_PATH"
+      return 1
+    }
+    return 0
+  fi
+
+  local safe cache_file
+  safe=$(safe_cache_name "$CLUSTER_REF")
+  cache_file="$CLUSTER_SSH_CACHE_DIR/assets/${safe}.kubeconfig"
+
+  if ! cache_is_fresh "$cache_file" "$ASSET_CACHE_TTL"; then
+    extract_secret_to_file \
+      "$CLUSTER_NAMESPACE" \
+      "${CLUSTER_NAME}${KUBECONFIG_SECRET_SUFFIX}" \
+      "$KUBECONFIG_SECRET_KEY" \
+      "$cache_file" || return 1
+  fi
+
+  KUBECONFIG_PATH="$cache_file"
+}
+
+resolve_private_key() {
+  if [[ "$CLUSTER_SOURCE" == "static" ]]; then
+    PRIVATE_KEY_PATH=$(get_cluster_private_key "$CLUSTER_REF") || {
+      log_error "No private key mapping for cluster: $CLUSTER_REF"
+      return 1
+    }
+    [[ -f "$PRIVATE_KEY_PATH" ]] || {
+      log_error "Private key not found: $PRIVATE_KEY_PATH"
+      return 1
+    }
+    return 0
+  fi
+
+  if [[ -z "$RUNTIME_DIR" ]]; then
+    RUNTIME_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cluster-ssh.XXXXXX")
+    chmod 700 "$RUNTIME_DIR"
+  fi
+
+  PRIVATE_KEY_PATH="$RUNTIME_DIR/${CLUSTER_NAME}.key"
+  extract_secret_to_file \
+    "$CLUSTER_NAMESPACE" \
+    "${CLUSTER_NAME}${SSH_SECRET_SUFFIX}" \
+    "$SSH_SECRET_KEY" \
+    "$PRIVATE_KEY_PATH"
+}
+
+node_cache_file() {
+  local cluster="$1"
+  printf '%s/nodes/%s.tsv\n' "$CLUSTER_SSH_CACHE_DIR" "$(safe_cache_name "$cluster")"
+}
+
+fetch_node_rows() {
+  "$KUBECTL_BIN" \
+    --kubeconfig "$KUBECONFIG_PATH" \
+    --request-timeout="$KUBECTL_REQUEST_TIMEOUT" \
+    get nodes \
+    -o go-template='{{range .items}}{{$ip := "-"}}{{$ready := "Unknown"}}{{range .status.addresses}}{{if eq .type "InternalIP"}}{{$ip = .address}}{{end}}{{end}}{{range .status.conditions}}{{if eq .type "Ready"}}{{$ready = .status}}{{end}}{{end}}{{.metadata.name}}{{"\t"}}{{$ip}}{{"\t"}}{{$ready}}{{"\t"}}{{if .spec.unschedulable}}true{{else}}false{{end}}{{"\t"}}{{.status.nodeInfo.kubeletVersion}}{{"\n"}}{{end}}'
+}
+
+load_node_rows() {
+  local requested="$1"
+  local force_refresh="${2:-false}"
+  resolve_cluster_kubeconfig "$requested"
+
+  local cache_file tmp
+  cache_file=$(node_cache_file "$CLUSTER_REF")
+
+  if [[ "$force_refresh" != "true" ]] && cache_is_fresh "$cache_file" "$NODE_CACHE_TTL"; then
+    mapfile -t NODE_ROWS <"$cache_file"
+    return 0
+  fi
+
+  tmp=$(mktemp "$CLUSTER_SSH_CACHE_DIR/nodes/.nodes.XXXXXX")
+  if fetch_node_rows >"$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$cache_file"
+    mapfile -t NODE_ROWS <"$cache_file"
+    return 0
+  fi
+
+  rm -f "$tmp"
+  if [[ -s "$cache_file" ]]; then
+    log_warn "Kubernetes API unavailable; using stale node cache for $CLUSTER_REF."
+    mapfile -t NODE_ROWS <"$cache_file"
+    return 0
+  fi
+
+  log_error "Could not retrieve nodes from cluster: $CLUSTER_REF"
+  return 1
+}
+
+print_nodes_table() {
+  local i=0 name ip ready unsched version scheduling status
+
+  printf '%-5s %-55s %-16s %-10s %-12s %s\n' "INDEX" "NODE" "INTERNAL-IP" "STATUS" "SCHEDULING" "VERSION"
+  printf '%-5s %-55s %-16s %-10s %-12s %s\n' "-----" "----" "-----------" "------" "----------" "-------"
+
+  local row
+  for row in "${NODE_ROWS[@]}"; do
+    IFS=$'\t' read -r name ip ready unsched version <<<"$row"
+    ((i += 1))
+    [[ "$ready" == "True" ]] && status="Ready" || status="NotReady"
+    [[ "$unsched" == "true" ]] && scheduling="Disabled" || scheduling="Enabled"
+    printf '%-5s %-55s %-16s %-10s %-12s %s\n' \
+      "$i" "$name" "${ip:--}" "$status" "$scheduling" "$version"
+  done
+}
+
+resolve_node_target() {
+  local target="$1"
+  local i=0 name ip ready unsched version
+  local matches=()
+
+  if [[ "$target" =~ ^[0-9]+$ ]] && ((target >= 1 && target <= ${#NODE_ROWS[@]})); then
+    IFS=$'\t' read -r name ip ready unsched version <<<"${NODE_ROWS[target-1]}"
+    printf '%s\t%s\n' "$name" "$ip"
+    return 0
+  fi
+
+  local row
+  for row in "${NODE_ROWS[@]}"; do
+    IFS=$'\t' read -r name ip ready unsched version <<<"$row"
+    ((i += 1))
+    if [[ "$target" == "$name" || "$target" == "$ip" ]]; then
+      matches+=("$name"$'\t'"$ip")
+    fi
+  done
+
+  if ((${#matches[@]} == 1)); then
+    printf '%s\n' "${matches[0]}"
+    return 0
+  fi
+
+  log_error "Node target does not belong to cluster [$CLUSTER_REF]: $target"
+  print_nodes_table >&2
+  return 1
+}
+
+select_node_interactively() {
+  print_nodes_table >&2
+
+  [[ -t 0 && -t 1 ]] || {
+    log_error "Interactive node selection requires a TTY. Specify node name, IP, or index."
+    return 2
+  }
+
+  local selected
+  if command -v fzf >/dev/null 2>&1; then
+    local menu=() row name ip ready unsched version i=0 status scheduling
+    for row in "${NODE_ROWS[@]}"; do
+      IFS=$'\t' read -r name ip ready unsched version <<<"$row"
+      ((i += 1))
+      [[ "$ready" == "True" ]] && status="Ready" || status="NotReady"
+      [[ "$unsched" == "true" ]] && scheduling="Disabled" || scheduling="Enabled"
+      menu+=("$(printf '%s\t%s\t%s\t%s\t%s' "$i" "$name" "$ip" "$status" "$scheduling")")
+    done
+    selected=$(printf '%s\n' "${menu[@]}" | fzf --delimiter=$'\t' --with-nth=1,2,3,4,5 --header=$'INDEX\tNODE\tIP\tSTATUS\tSCHEDULING') || return 1
+    printf '%s\n' "$selected" | cut -f1
+    return 0
+  fi
+
+  printf '\nSelect node by INDEX, NODE, or IP: ' >&2
+  IFS= read -r selected
+  [[ -n "$selected" ]] || return 1
+  printf '%s\n' "$selected"
+}
+
+ssh_base_args() {
+  SSH_ARGS=(
+    -i "$PRIVATE_KEY_PATH"
+    -o UserKnownHostsFile="$CLUSTER_SSH_KNOWN_HOSTS"
+    "${CLUSTER_SSH_OPTS[@]}"
+  )
+}
+
+prepare_connection() {
+  local cluster="$1"
+  local target="$2"
+  load_node_rows "$cluster"
+  resolve_private_key
+
+  local resolved
+  resolved=$(resolve_node_target "$target") || return 1
+  TARGET_NODE_NAME="${resolved%%$'\t'*}"
+  TARGET_NODE_IP="${resolved#*$'\t'}"
+
+  [[ -n "$TARGET_NODE_IP" ]] || {
+    log_error "Node has no InternalIP: $TARGET_NODE_NAME"
+    return 1
+  }
+
+  ssh_base_args
+}
+
+run_ssh() {
+  local cluster="$1"
+  local target="$2"
+  prepare_connection "$cluster" "$target"
+
+  log_info "Cluster : $CLUSTER_REF"
+  log_info "Node    : $TARGET_NODE_NAME"
+  log_info "IP      : $TARGET_NODE_IP"
+  log_info "User    : $CLUSTER_SSH_USER"
+
+  local rc=0
+  if "$SSH_BIN" "${SSH_ARGS[@]}" "${CLUSTER_SSH_USER}@${TARGET_NODE_IP}"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  if ((rc == 255)); then
+    log_error "SSH connection/authentication failed. Verify route, host key, user, and private key."
+  elif ((rc != 0)); then
+    log_warn "SSH session ended with remote exit code: $rc"
+  fi
+  return "$rc"
+}
+
+run_check() {
+  local cluster="$1"
+  local target="$2"
+  prepare_connection "$cluster" "$target"
+
+  local rc=0
+  if "$SSH_BIN" "${SSH_ARGS[@]}" -o BatchMode=yes \
+      "${CLUSTER_SSH_USER}@${TARGET_NODE_IP}" 'hostname' >/dev/null; then
+    printf '[OK] cluster=%s node=%s ip=%s ssh=reachable\n' "$CLUSTER_REF" "$TARGET_NODE_NAME" "$TARGET_NODE_IP"
+  else
+    rc=$?
+    printf '[FAIL] cluster=%s node=%s ip=%s ssh=unreachable rc=%s\n' \
+      "$CLUSTER_REF" "$TARGET_NODE_NAME" "$TARGET_NODE_IP" "$rc" >&2
+    return "$rc"
+  fi
+}
+
+run_exec() {
+  local cluster="$1"
+  local target="$2"
+  shift 2
+  [[ "${1:-}" == "--" ]] && shift
+  (($# > 0)) || {
+    log_error "Remote command is required."
+    return 1
+  }
+
+  prepare_connection "$cluster" "$target"
+
+  local remote_command
+  remote_command="$*"
+  local quoted
+  printf -v quoted '%q' "$remote_command"
+
+  "$SSH_BIN" "${SSH_ARGS[@]}" \
+    "${CLUSTER_SSH_USER}@${TARGET_NODE_IP}" \
+    "bash -lc $quoted"
+}
+
+run_doctor() {
+  local cluster="$1"
+  local target="$2"
+  shift 2
+
+  local output_file=""
+  while (($#)); do
+    case "$1" in
+      --output)
+        output_file="${2:-}"
+        [[ -n "$output_file" ]] || { log_error "--output requires a file path"; return 1; }
+        shift 2
+        ;;
+      *) log_error "Unknown doctor option: $1"; return 1 ;;
+    esac
+  done
+
+  prepare_connection "$cluster" "$target"
+  [[ -n "$output_file" ]] || output_file="cluster-ssh-doctor-$(safe_cache_name "$CLUSTER_REF")-$(safe_cache_name "$TARGET_NODE_NAME")-$(date +%Y%m%d-%H%M%S).log"
+
+  {
+    echo "# cluster-ssh doctor"
+    echo "timestamp=$(date -Is)"
+    echo "cluster=$CLUSTER_REF"
+    echo "node=$TARGET_NODE_NAME"
+    echo "ip=$TARGET_NODE_IP"
+    echo
+
+    echo "## Kubernetes Node"
+    "$KUBECTL_BIN" --kubeconfig "$KUBECONFIG_PATH" describe node "$TARGET_NODE_NAME" 2>&1 || true
+    echo
+
+    echo "## Pods on Node"
+    "$KUBECTL_BIN" --kubeconfig "$KUBECONFIG_PATH" get pods -A \
+      --field-selector "spec.nodeName=$TARGET_NODE_NAME" -o wide 2>&1 || true
+    echo
+
+    echo "## Node Events"
+    "$KUBECTL_BIN" --kubeconfig "$KUBECONFIG_PATH" get events -A \
+      --field-selector "involvedObject.kind=Node,involvedObject.name=$TARGET_NODE_NAME" \
+      --sort-by='.lastTimestamp' 2>&1 || true
+    echo
+
+    echo "## Remote Node Checks"
+    "$SSH_BIN" "${SSH_ARGS[@]}" "${CLUSTER_SSH_USER}@${TARGET_NODE_IP}" 'bash -s' <<'REMOTE_DOCTOR' 2>&1 || true
+set +e
+section() { printf '\n### %s\n' "$1"; }
+
+section "Identity and Uptime"
+hostname -f 2>/dev/null || hostname
+date -Is
+uptime
+
+section "Addresses"
+ip -br addr
+
+section "Routes"
+ip route
+ip -6 route 2>/dev/null || true
+
+section "Neighbors"
+ip neigh
+
+section "Sockets Summary"
+ss -s 2>/dev/null || true
+
+section "Filesystem"
+df -hT
+df -ih
+
+section "Memory"
+free -m
+
+section "Pressure"
+cat /proc/pressure/cpu 2>/dev/null || true
+cat /proc/pressure/memory 2>/dev/null || true
+cat /proc/pressure/io 2>/dev/null || true
+
+section "Services"
+for svc in kubelet containerd; do
+  printf '%-12s ' "$svc"
+  sudo -n systemctl is-active "$svc" 2>/dev/null || systemctl is-active "$svc" 2>/dev/null || true
+done
+
+section "Kubelet Warnings - Last 30 Minutes"
+sudo -n journalctl -u kubelet --since '-30 min' -p warning --no-pager -n 200 2>/dev/null || \
+  journalctl -u kubelet --since '-30 min' -p warning --no-pager -n 200 2>/dev/null || true
+
+section "Container Runtime"
+sudo -n crictl info 2>/dev/null | head -n 80 || true
+sudo -n crictl ps -a 2>/dev/null | head -n 100 || true
+
+section "Kernel Warnings"
+sudo -n dmesg --level=err,warn 2>/dev/null | tail -n 120 || true
+REMOTE_DOCTOR
+  } | tee "$output_file"
+
+  log_info "Doctor report saved: $output_file"
+}
+
+validate_ipv4_or_ipv6() {
+  [[ "$1" =~ ^[0-9A-Fa-f:.]+$ ]]
+}
+
+run_egress_check() {
+  local cluster="$1"
+  local target="$2"
+  shift 2
+
+  local egress_ip="" dst="" port="" iface=""
+  while (($#)); do
+    case "$1" in
+      --egress-ip) egress_ip="${2:-}"; shift 2 ;;
+      --dst)       dst="${2:-}"; shift 2 ;;
+      --port)      port="${2:-}"; shift 2 ;;
+      --iface)     iface="${2:-}"; shift 2 ;;
+      *) log_error "Unknown egress-check option: $1"; return 1 ;;
+    esac
+  done
+
+  [[ -n "$egress_ip" ]] || { log_error "--egress-ip is required"; return 1; }
+  validate_ipv4_or_ipv6 "$egress_ip" || { log_error "Invalid egress IP: $egress_ip"; return 1; }
+  [[ -z "$dst" ]] || validate_ipv4_or_ipv6 "$dst" || { log_error "Invalid destination IP: $dst"; return 1; }
+  [[ -z "$port" || "$port" =~ ^[0-9]+$ ]] || { log_error "Invalid port: $port"; return 1; }
+  [[ -z "$iface" || "$iface" =~ ^[[:alnum:]_.:@-]+$ ]] || { log_error "Invalid interface: $iface"; return 1; }
+
+  prepare_connection "$cluster" "$target"
+
+  "$SSH_BIN" "${SSH_ARGS[@]}" "${CLUSTER_SSH_USER}@${TARGET_NODE_IP}" \
+    bash -s -- "$egress_ip" "$dst" "$port" "$iface" <<'REMOTE_EGRESS'
+set -u
+EGRESS_IP="$1"
+DST="${2:-}"
+PORT="${3:-}"
+IFACE="${4:-}"
+
+section() { printf '\n## %s\n' "$1"; }
+
+section "Input"
+printf 'host=%s\n' "$(hostname)"
+printf 'egress_ip=%s\n' "$EGRESS_IP"
+printf 'destination=%s\n' "${DST:--}"
+printf 'port=%s\n' "${PORT:--}"
+
+section "Local Address Ownership"
+ip -br addr | grep -F "$EGRESS_IP" || echo "Egress IP is not shown in ip addr output."
+
+if [[ -z "$IFACE" ]]; then
+  IFACE=$(ip route get "$EGRESS_IP" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+fi
+printf 'interface=%s\n' "${IFACE:--}"
+
+section "Route"
+[[ -n "$DST" ]] && ip route get "$DST" || true
+ip route get "$EGRESS_IP" 2>/dev/null || true
+
+section "Neighbor Entry"
+ip neigh show "$EGRESS_IP" || true
+
+section "ARP/Neighbor Probe"
+if [[ -n "$IFACE" && "$EGRESS_IP" != *:* ]] && command -v arping >/dev/null 2>&1; then
+  LOCAL_MAC=$(cat "/sys/class/net/$IFACE/address" 2>/dev/null || true)
+  printf 'local_mac=%s\n' "${LOCAL_MAC:--}"
+  ARP_OUTPUT=$(sudo -n arping -I "$IFACE" -c 5 "$EGRESS_IP" 2>&1 || arping -I "$IFACE" -c 5 "$EGRESS_IP" 2>&1 || true)
+  printf '%s\n' "$ARP_OUTPUT"
+  MACS=$(printf '%s\n' "$ARP_OUTPUT" | grep -Eio '([0-9a-f]{2}:){5}[0-9a-f]{2}' | tr '[:upper:]' '[:lower:]' | sort -u || true)
+  MAC_COUNT=$(printf '%s\n' "$MACS" | sed '/^$/d' | wc -l)
+  printf 'unique_response_macs=%s\n' "$MAC_COUNT"
+  if ((MAC_COUNT > 1)); then
+    echo "[CRITICAL] Multiple MAC addresses answered for the same Egress IP. Duplicate ownership is highly likely."
+  elif ((MAC_COUNT == 1)); then
+    echo "[INFO] One MAC answered. Compare it with the expected node/interface MAC and the virtualization or switch MAC table."
+  else
+    echo "[INFO] No ARP response observed. This does not prove the IP is unused when proxy ARP, overlay networking, filtering, or a different L2 domain is involved."
+  fi
+else
+  echo "ARP probe skipped: IPv6, interface unavailable, or arping not installed."
+fi
+
+section "Destination Connectivity"
+if [[ -n "$DST" && -n "$PORT" ]]; then
+  if command -v nc >/dev/null 2>&1; then
+    nc -vz -w 3 "$DST" "$PORT" 2>&1 || true
+  else
+    timeout 3 bash -c "</dev/tcp/$DST/$PORT" 2>&1 && echo "TCP connect succeeded" || echo "TCP connect failed"
+  fi
+fi
+
+section "Conntrack Evidence"
+if [[ -n "$DST" ]] && command -v conntrack >/dev/null 2>&1; then
+  sudo -n conntrack -L 2>/dev/null | grep -E "${EGRESS_IP}|${DST}" | tail -n 100 || true
+else
+  echo "conntrack unavailable or destination not supplied."
+fi
+
+section "Recommended Interpretation"
+cat <<'TEXT'
+- Two or more response MACs for one IP: strong duplicate-IP evidence.
+- One unexpected MAC: identify the owner in vCenter/NSX/switch MAC tables.
+- Egress IP removal followed by continued ARP replies: the address is owned outside the expected Kubernetes path.
+- No ARP reply: continue with route, NAT, conntrack, firewall, and return-path checks; ARP alone is not conclusive across L3/overlay boundaries.
+TEXT
+REMOTE_EGRESS
+}
+
+run_refresh() {
+  local requested="${1:-}"
+  if [[ -z "$requested" ]]; then
+    rm -rf "$CLUSTER_SSH_CACHE_DIR/nodes" "$CLUSTER_SSH_CACHE_DIR/assets" "$CLUSTER_SSH_CACHE_DIR/clusters.tsv"
+    mkdir -p "$CLUSTER_SSH_CACHE_DIR/nodes" "$CLUSTER_SSH_CACHE_DIR/assets"
+    chmod 700 "$CLUSTER_SSH_CACHE_DIR/nodes" "$CLUSTER_SSH_CACHE_DIR/assets" 2>/dev/null || true
+    log_info "All cluster-ssh caches were cleared."
+    return 0
+  fi
+
+  resolve_cluster "$requested"
+  rm -f "$(node_cache_file "$CLUSTER_REF")"
+  rm -f "$CLUSTER_SSH_CACHE_DIR/assets/$(safe_cache_name "$CLUSTER_REF").kubeconfig"
+  log_info "Cache cleared for: $CLUSTER_REF"
+}
+
+run_nodes() {
+  load_node_rows "$1" true
+  echo "Cluster: $CLUSTER_REF"
+  print_nodes_table
+}
+
+run_interactive_cluster() {
+  local cluster="$1"
+  load_node_rows "$cluster"
+  local selected
+  selected=$(select_node_interactively) || return $?
+  run_ssh "$cluster" "$selected"
+}
+
+completion_clusters() {
+  list_all_cluster_refs
+}
+
+completion_nodes() {
+  local cluster="$1"
+  load_node_rows "$cluster" false 2>/dev/null || return 0
+  local row name ip ready unsched version
+  for row in "${NODE_ROWS[@]}"; do
+    IFS=$'\t' read -r name ip ready unsched version <<<"$row"
+    printf '%s\n' "$name"
+    [[ -n "$ip" ]] && printf '%s\n' "$ip"
+  done | sort -u
+}
+
+main() {
+  require_command "$KUBECTL_BIN"
+  require_command "$SSH_BIN"
+  require_command base64
+
+  (($# > 0)) || { show_usage; return 1; }
+
+  case "$1" in
+    list)
+      (($# == 1)) || { show_usage; return 1; }
+      print_cluster_list
+      ;;
+    nodes)
+      (($# == 2)) || { show_usage; return 1; }
+      run_nodes "$2"
+      ;;
+    check)
+      (($# == 3)) || { show_usage; return 1; }
+      run_check "$2" "$3"
+      ;;
+    exec)
+      (($# >= 5)) || { show_usage; return 1; }
+      run_exec "$2" "$3" "${@:4}"
+      ;;
+    doctor)
+      (($# >= 3)) || { show_usage; return 1; }
+      run_doctor "$2" "$3" "${@:4}"
+      ;;
+    egress-check)
+      (($# >= 5)) || { show_usage; return 1; }
+      run_egress_check "$2" "$3" "${@:4}"
+      ;;
+    refresh)
+      (($# <= 2)) || { show_usage; return 1; }
+      run_refresh "${2:-}"
+      ;;
+    version)
+      echo "cluster-ssh $VERSION"
+      ;;
+    -h|--help|help)
+      show_usage
+      ;;
+    __complete)
+      case "${2:-}" in
+        clusters) completion_clusters ;;
+        nodes) [[ -n "${3:-}" ]] && completion_nodes "$3" ;;
+      esac
+      ;;
+    *)
+      if (($# == 1)); then
+        run_interactive_cluster "$1"
+      elif (($# == 2)); then
+        run_ssh "$1" "$2"
+      else
+        show_usage
+        return 1
+      fi
+      ;;
+  esac
+}
+
+main "$@"
