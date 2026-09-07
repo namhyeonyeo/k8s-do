@@ -1,198 +1,384 @@
-# cluster-ssh v2 설치 및 운영 가이드
+# cluster-ssh v3 설치 및 Egress 통합 진단 Runbook
 
-## 1. 주요 변경점
+## 1. v3 변경사항
 
-- `cluster-ssh <cluster>` 실행 시 노드 이름과 IP 목록을 출력하고 대화형으로 선택
-- 노드 이름, IP, 목록의 INDEX 모두 접속 대상으로 사용 가능
-- Bash completion이 IP뿐 아니라 노드 이름도 자동완성
-- completion 파일이 Kubernetes 조회 로직을 복제하지 않고 `cluster-ssh __complete`를 호출
-- Static / Supervisor API / Hybrid discovery 지원
-- `doctor`, `exec`, `egress-check` 진단 명령 추가
-- Supervisor API 모드에서 kubeconfig는 보안 캐시에 저장하고 SSH private key는 실행 중 임시 디렉터리에만 생성 후 삭제
-- 노드/API 조회 캐시로 Tab completion 지연 완화
+`egress-check`가 다음 작업을 하나의 명령에서 수행한다.
 
-## 2. 설치
+1. 지정한 클러스터의 kubeconfig 해석
+2. `fix-tool` Namespace에서 이름이 `fix-tool`로 시작하는 Running Pod 자동 탐색
+3. Pod 이름, Pod IP, Pod가 위치한 Node 조회
+4. 지정한 Egress Node에 SSH 연결
+5. Egress IP의 로컬 소유 여부와 실제 외부 route interface 확인
+6. 실제 route interface에서 ARP 응답 MAC 수집
+7. Egress Node에서 tcpdump와 conntrack 감시 시작
+8. fix-tool Pod 내부에서 목적지 TCP 연결 실행
+9. Pod 트래픽, Egress IP SNAT, return traffic 증거 판정
+10. 전체 결과를 로그 파일에 저장
 
-```bash
-sudo mkdir -p /etc/cluster-ssh
-sudo cp cluster-ssh-v2 /usr/local/bin/cluster-ssh
-sudo cp config-v2.sh /etc/cluster-ssh/config.sh
-sudo cp cluster-ssh-v2.completion /etc/bash_completion.d/cluster-ssh
+Node 검사는 SSH, Pod 조회와 통신 발생은 `kubectl exec`를 사용한다.
 
-sudo chmod 755 /usr/local/bin/cluster-ssh
-sudo chmod 640 /etc/cluster-ssh/config.sh
-sudo chmod 644 /etc/bash_completion.d/cluster-ssh
+---
+
+## 2. 배포 파일
+
+```text
+cluster-ssh-v3
+cluster-ssh-v3.completion
+config-v3.sh
 ```
 
-Config를 여러 사용자가 공용으로 읽어야 하는 환경에서는 그룹을 지정합니다.
+구문 검사:
 
 ```bash
-sudo chown root:k8s-ops /etc/cluster-ssh/config.sh
-sudo chmod 640 /etc/cluster-ssh/config.sh
+bash -n cluster-ssh-v3
+bash -n cluster-ssh-v3.completion
+bash -n config-v3.sh
 ```
 
-Completion 반영:
+---
+
+## 3. 기존 v2 백업
 
 ```bash
-source /etc/bash_completion
+BACKUP_DIR="/root/cluster-ssh-backup-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+
+cp -a /usr/local/bin/cluster-ssh \
+  "$BACKUP_DIR/cluster-ssh" 2>/dev/null || true
+
+cp -a /etc/cluster-ssh/config.sh \
+  "$BACKUP_DIR/config.sh" 2>/dev/null || true
+
+cp -a /etc/bash_completion.d/cluster-ssh \
+  "$BACKUP_DIR/cluster-ssh.completion" 2>/dev/null || true
+
+echo "$BACKUP_DIR"
+```
+
+---
+
+## 4. 교체 대상
+
+| 운영 경로 | v3 원본 |
+|---|---|
+| `/usr/local/bin/cluster-ssh` | `cluster-ssh-v3` |
+| `/etc/bash_completion.d/cluster-ssh` | `cluster-ssh-v3.completion` |
+| `/etc/cluster-ssh/config.sh` | `config-v3.sh`를 환경에 맞게 수정한 파일 |
+
+실행 파일과 completion은 바로 교체할 수 있다.
+
+`config.sh`는 기존 실제 kubeconfig/private key 경로를 유지해야 하므로 무조건 덮어쓰지 않는다.
+
+---
+
+## 5. 샌드박스용 config 확인
+
+제공된 `config-v3.sh`는 다음 샌드박스 구조를 기본 예시로 사용한다.
+
+```text
+cluster alias: dev-workload
+kubeconfig   : /srv/tanzu/file/ssh/kubeconfigs/dev-workload.conf
+private key  : /srv/tanzu/file/ssh/privatekey/dev-workload.pem
+```
+
+실제 파일 확인:
+
+```bash
+ls -l /srv/tanzu/file/ssh/kubeconfigs/dev-workload.conf
+ls -l /srv/tanzu/file/ssh/privatekey/dev-workload.pem
+```
+
+파일명이 다르면 `config-v3.sh`의 다음 함수를 수정한다.
+
+```bash
+get_cluster_kubeconfig()
+get_cluster_private_key()
+```
+
+기본 Egress 테스트 Pod 설정:
+
+```bash
+FIX_TOOL_NAMESPACE="fix-tool"
+FIX_TOOL_POD_PREFIX="fix-tool"
+EGRESS_CHECK_TIMEOUT=10
+```
+
+---
+
+## 6. 설치
+
+```bash
+install -d -m 750 /etc/cluster-ssh
+install -d -m 755 /etc/bash_completion.d
+
+install -m 755 \
+  cluster-ssh-v3 \
+  /usr/local/bin/cluster-ssh
+
+install -m 644 \
+  cluster-ssh-v3.completion \
+  /etc/bash_completion.d/cluster-ssh
+```
+
+config는 검토한 뒤 설치한다.
+
+```bash
+cp config-v3.sh /tmp/config-v3.sh
+vi /tmp/config-v3.sh
+bash -n /tmp/config-v3.sh
+
+install -m 640 \
+  /tmp/config-v3.sh \
+  /etc/cluster-ssh/config.sh
+```
+
+---
+
+## 7. completion 반영
+
+v3 completion은 `_init_completion`에 의존하지 않는다.
+
+```bash
 source /etc/bash_completion.d/cluster-ssh
+complete -p cluster-ssh
 ```
 
-## 3. Static 모드
+새 로그인에도 자동 로딩되지 않는 환경이면 `/root/.bashrc` 또는 사용자 `.bashrc`에 추가한다.
 
 ```bash
-CLUSTER_DISCOVERY_MODE="static"
+cat >> ~/.bashrc <<'BASHRC'
+if [[ -f /etc/bash_completion.d/cluster-ssh ]]; then
+  source /etc/bash_completion.d/cluster-ssh
+fi
+BASHRC
 ```
 
-기존처럼 `CLUSTERS`, `get_cluster_kubeconfig()`, `get_cluster_private_key()`를 사용합니다.
+---
+
+## 8. 설치 후 기본 검증
 
 ```bash
-cluster-ssh list
-cluster-ssh nodes dev-workload
-cluster-ssh dev-workload
-cluster-ssh dev-workload <node-name>
-cluster-ssh dev-workload <node-ip>
-cluster-ssh dev-workload 2
-```
-
-## 4. Supervisor API 모드
-
-```bash
-CLUSTER_DISCOVERY_MODE="supervisor"
-SUPERVISOR_KUBECONFIG="/secure/path/supervisor-kubeconfig"
-```
-
-필요한 권한:
-
-```text
-clusters.cluster.x-k8s.io: get, list
-secrets/<cluster-name>-kubeconfig: get
-secrets/<cluster-name>-ssh: get
-```
-
-동작 흐름:
-
-```text
-Supervisor API
-  ├─ Cluster API 객체 조회: namespace/cluster-name
-  ├─ <cluster-name>-kubeconfig Secret의 data.value 추출
-  ├─ Workload Cluster API에서 Node 이름/InternalIP 조회
-  └─ SSH 직전에 <cluster-name>-ssh Secret의 data.ssh-privatekey 추출
-```
-
-테스트:
-
-```bash
-cluster-ssh refresh
-cluster-ssh list
-cluster-ssh nodes <namespace>/<cluster-name>
-cluster-ssh <namespace>/<cluster-name>
-```
-
-짧은 별칭 사용:
-
-```bash
-declare -A CLUSTER_ALIASES=(
-  [dev-workload]="dev-ns/tkg-example-dev-workload-cluster-001"
-)
-```
-
-## 5. Hybrid 모드
-
-```bash
-CLUSTER_DISCOVERY_MODE="hybrid"
-```
-
-Static mapping을 우선 사용하고, Static에 없는 이름은 Supervisor API에서 조회합니다.
-
-## 6. 노드 선택 UX
-
-`cluster-ssh dev-workload`를 실행하면 다음과 같이 표시됩니다.
-
-```text
-INDEX NODE                                                   INTERNAL-IP      STATUS     SCHEDULING   VERSION
-1     tkg-dev-control-plane-xxxxx                            10.10.10.11      Ready      Enabled      v1.30.1
-2     tkg-dev-md-0-xxxxx                                     10.10.10.21      Ready      Enabled      v1.30.1
-3     tkg-dev-md-0-yyyyy                                     10.10.10.22      Ready      Enabled      v1.30.1
-```
-
-`fzf`가 설치되어 있으면 검색형 선택 화면을 사용하고, 없으면 INDEX/노드 이름/IP를 입력합니다.
-
-## 7. 트러블슈팅 명령
-
-### 노드 기본 진단
-
-```bash
-cluster-ssh doctor dev-workload <node-name>
-```
-
-수집 항목:
-
-- Kubernetes Node describe
-- 해당 노드에 배치된 Pod
-- Node 이벤트
-- 주소, 라우팅, neighbor table
-- 파일시스템, inode, 메모리, PSI
-- kubelet/containerd 상태
-- 최근 kubelet warning 로그
-- crictl 상태
-- kernel warning
-
-출력 파일 지정:
-
-```bash
-cluster-ssh doctor dev-workload <node-name> --output /tmp/node-doctor.log
-```
-
-### 원격 읽기 명령
-
-```bash
-cluster-ssh exec dev-workload <node-name> -- \
-  'sudo journalctl -u kubelet --since "-20 min" --no-pager'
-```
-
-### Egress IP 충돌 확인
-
-```bash
-cluster-ssh egress-check dev-workload <egress-node> \
-  --egress-ip 10.60.93.191 \
-  --dst 10.60.191.31 \
-  --port 8522
-```
-
-주의: ARP 결과는 동일 L2 구간에서 가장 유효합니다. Overlay, proxy ARP, 라우터 경유, 보안장비 필터링 환경에서는 ARP 무응답만으로 미사용 IP라고 단정하면 안 됩니다.
-
-## 8. 캐시
-
-기본 위치:
-
-```text
-~/.cache/cluster-ssh/
-```
-
-캐시 삭제:
-
-```bash
-cluster-ssh refresh
-cluster-ssh refresh dev-workload
-```
-
-## 9. 보안 권고
-
-- Supervisor kubeconfig에는 최소 권한만 부여
-- 가능하면 Secret 전체 `get` 권한 대신 대상 namespace와 이름을 제한한 Role 사용
-- Private key는 공용 디렉터리에 영구 저장하지 않음
-- `StrictHostKeyChecking=no`를 사용하지 않음
-- cluster-ssh 전용 known_hosts 파일을 사용
-- `exec`는 감사 로그 대상이며, 운영 정책상 필요하면 허용 명령 allowlist 방식으로 제한
-- 진단 기본값은 읽기 전용으로 유지하고 drain/restart/delete 같은 변경 작업은 별도 승인 명령으로 분리
-
-## 10. 검증
-
-```bash
-bash -n /usr/local/bin/cluster-ssh
 cluster-ssh version
 cluster-ssh list
 cluster-ssh nodes dev-workload
-cluster-ssh check dev-workload <node-name>
+cluster-ssh __complete clusters
+cluster-ssh __complete nodes dev-workload
 ```
+
+예상 버전:
+
+```text
+cluster-ssh 3.0.0
+```
+
+fix-tool Pod 확인:
+
+```bash
+kubectl \
+  --kubeconfig /srv/tanzu/file/ssh/kubeconfigs/dev-workload.conf \
+  -n fix-tool get pods -o wide
+```
+
+Running 상태이며 이름이 `fix-tool`로 시작하는 Pod가 정확히 하나 있어야 자동 선택된다.
+
+---
+
+## 9. Egress 통합 진단 실행
+
+```bash
+cluster-ssh egress-check \
+  dev-workload \
+  <egress-node-name> \
+  --egress-ip 10.60.196.92 \
+  --dst 10.60.196.60 \
+  --port 22
+```
+
+기본적으로 자동 사용되는 값:
+
+```text
+namespace : fix-tool
+pod prefix: fix-tool
+timeout   : 10 seconds
+```
+
+특정 Pod를 지정하려면:
+
+```bash
+cluster-ssh egress-check \
+  dev-workload \
+  <egress-node-name> \
+  --egress-ip 10.60.196.92 \
+  --dst 10.60.196.60 \
+  --port 22 \
+  --pod fix-tool-xxxxxxxxxx-yyyyy
+```
+
+특정 컨테이너:
+
+```bash
+... --container netshoot
+```
+
+결과 파일 지정:
+
+```bash
+... --output /tmp/egress-check.log
+```
+
+외부 route interface 자동 탐지가 잘못된 경우에만:
+
+```bash
+... --iface eth0
+```
+
+---
+
+## 10. Pod 자동 선택 규칙
+
+```text
+Running fix-tool prefix Pod 0개
+→ 명령 실패
+
+Running fix-tool prefix Pod 1개
+→ 자동 선택
+
+Running fix-tool prefix Pod 2개 이상
+→ 임의 선택하지 않고 실패
+→ --pod로 정확한 Pod 지정
+```
+
+---
+
+## 11. Pod 이미지 요구사항
+
+Pod 내부 TCP 테스트 명령은 다음 우선순위를 사용한다.
+
+```text
+1. nc
+2. curl telnet://
+3. timeout + bash /dev/tcp
+```
+
+최소 하나가 있어야 한다. netshoot 계열 이미지 사용을 권장한다.
+
+확인:
+
+```bash
+kubectl --kubeconfig <kubeconfig> -n fix-tool exec <pod> -- \
+  sh -c 'command -v nc || command -v curl || { command -v timeout && command -v bash; }'
+```
+
+---
+
+## 12. Egress Node 요구사항
+
+필수:
+
+```text
+ip
+ssh daemon
+```
+
+증거 수집 권장:
+
+```text
+arping
+tcpdump
+conntrack
+timeout
+sudo -n 권한
+```
+
+도구 확인:
+
+```bash
+cluster-ssh exec dev-workload <egress-node> -- \
+  'for c in ip arping tcpdump conntrack timeout; do command -v "$c" || echo "MISSING: $c"; done'
+```
+
+sudo 확인:
+
+```bash
+cluster-ssh exec dev-workload <egress-node> -- \
+  'sudo -n true && echo SUDO_OK || echo SUDO_PASSWORD_REQUIRED'
+```
+
+sudo 또는 capability가 없으면 tcpdump/conntrack 증거가 제한될 수 있다.
+
+---
+
+## 13. 결과 해석
+
+### 정상에 가까운 결과
+
+```text
+[PASS] Egress IP is present on the selected Egress Node.
+[PASS] TCP connectivity from fix-tool/... succeeded.
+[PASS] Outbound traffic with source Egress IP ... was observed.
+[PASS] Return traffic to Egress IP ... was observed.
+```
+
+### SNAT 미확인
+
+```text
+[FAIL] Expected SNAT source ... was not observed on the external interface.
+```
+
+가능한 원인:
+
+- 잘못된 Egress Node를 지정
+- Egress 정책의 Namespace/Pod selector 불일치
+- CNI에서 다른 Node에 Egress IP를 배치
+- 실제 route interface 자동 탐지 오류
+- tcpdump 권한 부족
+- CNI dataplane에서 예상과 다른 지점에서 NAT 처리
+
+### 복수 MAC 응답
+
+```text
+[CRITICAL] Multiple MAC addresses responded for the Egress IP.
+```
+
+IP 충돌 강력 의심이며 응답 MAC을 vCenter, NSX, 물리 스위치 MAC table에서 역추적한다.
+
+단, proxy ARP나 네트워크 가상화 구현에 따라 ARP 결과만으로 최종 확정하지 않는다.
+
+### Pod 접속 성공, Pod IP가 Egress Node에서 안 보임
+
+Pod IP가 Egress Node에 들어오기 전에 overlay 또는 CNI dataplane에서 캡슐화/NAT될 수 있다. 외부 interface에서 Egress IP source가 확인되는지가 더 중요한 증거다.
+
+---
+
+## 14. Exit code
+
+| Code | 의미 |
+|---:|---|
+| 0 | Egress IP 존재, Pod 테스트 성공, Egress IP SNAT 증거 확인 |
+| 1 | 입력/설정/Pod 탐색/SSH/capture 준비 오류 |
+| 2 | Pod 연결 실패, Egress IP 미소유 또는 SNAT 증거 미확인 |
+| 3 | 복수 ARP MAC 감지 |
+
+실행 후:
+
+```bash
+cluster-ssh egress-check ...
+echo $?
+```
+
+---
+
+## 15. 안전성
+
+v3 `egress-check`는 다음 변경 작업을 수행하지 않는다.
+
+```text
+Egress IP 해제
+conntrack 삭제
+iptables/nftables 변경
+interface 변경
+node cordon/drain
+service restart
+```
+
+읽기 전용 패킷/상태 수집과 TCP connect 테스트만 수행한다.

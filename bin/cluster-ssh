@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-VERSION="2.0.0"
+VERSION="3.0.0"
 CONFIG_FILE="${CLUSTER_SSH_CONFIG:-/etc/cluster-ssh/config.sh}"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -29,6 +29,9 @@ source "$CONFIG_FILE"
 : "${SSH_SECRET_KEY:=ssh-privatekey}"
 : "${CLUSTER_SSH_CACHE_DIR:=${XDG_CACHE_HOME:-$HOME/.cache}/cluster-ssh}"
 : "${CLUSTER_SSH_KNOWN_HOSTS:=${XDG_STATE_HOME:-$HOME/.local/state}/cluster-ssh/known_hosts}"
+: "${FIX_TOOL_NAMESPACE:=fix-tool}"
+: "${FIX_TOOL_POD_PREFIX:=fix-tool}"
+: "${EGRESS_CHECK_TIMEOUT:=10}"
 
 if ! declare -p CLUSTER_SSH_OPTS >/dev/null 2>&1; then
   CLUSTER_SSH_OPTS=(
@@ -77,7 +80,10 @@ Usage:
   cluster-ssh exec <cluster> <node-name|node-ip|index> -- '<remote command>'
   cluster-ssh doctor <cluster> <node-name|node-ip|index> [--output <file>]
   cluster-ssh egress-check <cluster> <node-name|node-ip|index> \
-      --egress-ip <ip> [--dst <ip>] [--port <port>] [--iface <interface>]
+      --egress-ip <ip> --dst <ip> --port <port> \
+      [--namespace <ns>] [--pod-prefix <prefix>] [--pod <name>] \
+      [--container <name>] [--iface <interface>] [--timeout <seconds>] \
+      [--output <file>]
   cluster-ssh refresh [cluster]
   cluster-ssh version
   cluster-ssh help
@@ -96,6 +102,12 @@ Examples:
   cluster-ssh exec dev-workload worker-node-01 -- 'sudo journalctl -u kubelet -n 100 --no-pager'
   cluster-ssh doctor dev-workload worker-node-01
   cluster-ssh egress-check dev-workload worker-node-01 --egress-ip 10.60.93.191 --dst 10.60.191.31 --port 8522
+
+Egress check defaults:
+  namespace  : fix-tool
+  pod prefix : fix-tool
+  The command finds one Running matching Pod, starts packet/conntrack capture on the Egress Node,
+  generates TCP traffic from the Pod, and prints an evidence-based verdict.
 EOF_USAGE
 }
 
@@ -698,99 +710,324 @@ run_egress_check() {
   shift 2
 
   local egress_ip="" dst="" port="" iface=""
+  local namespace="$FIX_TOOL_NAMESPACE"
+  local pod_prefix="$FIX_TOOL_POD_PREFIX"
+  local pod_name="" container_name=""
+  local timeout_seconds="$EGRESS_CHECK_TIMEOUT"
+  local capture_seconds=""
+  local output_file=""
+
   while (($#)); do
     case "$1" in
-      --egress-ip) egress_ip="${2:-}"; shift 2 ;;
-      --dst)       dst="${2:-}"; shift 2 ;;
-      --port)      port="${2:-}"; shift 2 ;;
-      --iface)     iface="${2:-}"; shift 2 ;;
+      --egress-ip)  egress_ip="${2:-}"; shift 2 ;;
+      --dst)        dst="${2:-}"; shift 2 ;;
+      --port)       port="${2:-}"; shift 2 ;;
+      --iface)      iface="${2:-}"; shift 2 ;;
+      --namespace)  namespace="${2:-}"; shift 2 ;;
+      --pod-prefix) pod_prefix="${2:-}"; shift 2 ;;
+      --pod)        pod_name="${2:-}"; shift 2 ;;
+      --container)  container_name="${2:-}"; shift 2 ;;
+      --timeout)    timeout_seconds="${2:-}"; shift 2 ;;
+      --output)     output_file="${2:-}"; shift 2 ;;
       *) log_error "Unknown egress-check option: $1"; return 1 ;;
     esac
   done
 
   [[ -n "$egress_ip" ]] || { log_error "--egress-ip is required"; return 1; }
+  [[ -n "$dst" ]]       || { log_error "--dst is required"; return 1; }
+  [[ -n "$port" ]]      || { log_error "--port is required"; return 1; }
   validate_ipv4_or_ipv6 "$egress_ip" || { log_error "Invalid egress IP: $egress_ip"; return 1; }
-  [[ -z "$dst" ]] || validate_ipv4_or_ipv6 "$dst" || { log_error "Invalid destination IP: $dst"; return 1; }
-  [[ -z "$port" || "$port" =~ ^[0-9]+$ ]] || { log_error "Invalid port: $port"; return 1; }
+  validate_ipv4_or_ipv6 "$dst" || { log_error "Invalid destination IP: $dst"; return 1; }
+  [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || { log_error "Invalid port: $port"; return 1; }
+  [[ "$timeout_seconds" =~ ^[0-9]+$ ]] && ((timeout_seconds >= 3 && timeout_seconds <= 120)) || { log_error "--timeout must be between 3 and 120 seconds"; return 1; }
+  capture_seconds=$((timeout_seconds + 5))
+  [[ "$namespace" =~ ^[[:alnum:]_.-]+$ ]] || { log_error "Invalid namespace: $namespace"; return 1; }
+  [[ "$pod_prefix" =~ ^[[:alnum:]_.-]+$ ]] || { log_error "Invalid pod prefix: $pod_prefix"; return 1; }
+  [[ -z "$pod_name" || "$pod_name" =~ ^[[:alnum:]_.-]+$ ]] || { log_error "Invalid pod name: $pod_name"; return 1; }
+  [[ -z "$container_name" || "$container_name" =~ ^[[:alnum:]_.-]+$ ]] || { log_error "Invalid container name: $container_name"; return 1; }
   [[ -z "$iface" || "$iface" =~ ^[[:alnum:]_.:@-]+$ ]] || { log_error "Invalid interface: $iface"; return 1; }
 
   prepare_connection "$cluster" "$target"
 
+  local pod_rows=()
+  if [[ -z "$pod_name" ]]; then
+    mapfile -t pod_rows < <(
+      "$KUBECTL_BIN" --kubeconfig "$KUBECONFIG_PATH" --request-timeout="$KUBECTL_REQUEST_TIMEOUT" \
+        -n "$namespace" get pods --field-selector=status.phase=Running \
+        -o go-template='{{range .items}}{{.metadata.name}}{{"\t"}}{{.status.podIP}}{{"\t"}}{{.spec.nodeName}}{{"\n"}}{{end}}' 2>/dev/null |
+      awk -F '\t' -v p="$pod_prefix" 'index($1,p)==1'
+    )
+
+    if ((${#pod_rows[@]} == 0)); then
+      log_error "No Running Pod with prefix '$pod_prefix' found in namespace '$namespace'."
+      return 1
+    elif ((${#pod_rows[@]} > 1)); then
+      log_error "Multiple Running Pods matched prefix '$pod_prefix' in namespace '$namespace'."
+      printf '        - %s\n' "${pod_rows[@]%%$'\t'*}" >&2
+      log_error "Specify one with --pod <pod-name>."
+      return 1
+    fi
+    pod_name="${pod_rows[0]%%$'\t'*}"
+  fi
+
+  local pod_info pod_ip pod_node pod_phase
+  pod_info=$("$KUBECTL_BIN" --kubeconfig "$KUBECONFIG_PATH" --request-timeout="$KUBECTL_REQUEST_TIMEOUT" \
+    -n "$namespace" get pod "$pod_name" \
+    -o go-template='{{.status.phase}}{{"\t"}}{{.status.podIP}}{{"\t"}}{{.spec.nodeName}}' 2>/dev/null) || {
+      log_error "Pod not found or unreadable: ${namespace}/${pod_name}"
+      return 1
+    }
+  IFS=$'\t' read -r pod_phase pod_ip pod_node <<<"$pod_info"
+  [[ "$pod_phase" == "Running" ]] || { log_error "Pod is not Running: ${namespace}/${pod_name} phase=$pod_phase"; return 1; }
+  [[ -n "$pod_ip" ]] || { log_error "Pod has no IP: ${namespace}/${pod_name}"; return 1; }
+
+  local exec_container_args=()
+  if [[ -n "$container_name" ]]; then
+    exec_container_args=(-c "$container_name")
+  fi
+
+  [[ -n "$output_file" ]] || output_file="cluster-ssh-egress-$(safe_cache_name "$CLUSTER_REF")-$(date +%Y%m%d-%H%M%S).log"
+  local work_dir
+  work_dir=$(mktemp -d "${TMPDIR:-/tmp}/cluster-ssh-egress.XXXXXX")
+  chmod 700 "$work_dir"
+  local remote_output="$work_dir/remote.log"
+  local pod_output="$work_dir/pod.log"
+
+  {
+    echo "# cluster-ssh egress-check v3"
+    echo "timestamp=$(date -Is)"
+    echo "cluster=$CLUSTER_REF"
+    echo "egress_node=$TARGET_NODE_NAME"
+    echo "egress_node_ip=$TARGET_NODE_IP"
+    echo "namespace=$namespace"
+    echo "pod=$pod_name"
+    echo "pod_ip=$pod_ip"
+    echo "pod_node=$pod_node"
+    echo "same_node=$([[ "$pod_node" == "$TARGET_NODE_NAME" ]] && echo true || echo false)"
+    echo "egress_ip=$egress_ip"
+    echo "destination=$dst"
+    echo "port=$port"
+    echo "timeout=$timeout_seconds"
+    echo
+  } | tee "$output_file"
+
   "$SSH_BIN" "${SSH_ARGS[@]}" "${CLUSTER_SSH_USER}@${TARGET_NODE_IP}" \
-    bash -s -- "$egress_ip" "$dst" "$port" "$iface" <<'REMOTE_EGRESS'
+    bash -s -- "$egress_ip" "$dst" "$port" "$iface" "$pod_ip" "$capture_seconds" >"$remote_output" 2>&1 <<'REMOTE_EGRESS_V3' &
 set -u
 EGRESS_IP="$1"
-DST="${2:-}"
-PORT="${3:-}"
-IFACE="${4:-}"
+DST="$2"
+PORT="$3"
+IFACE_OVERRIDE="${4:-}"
+POD_IP="$5"
+CAPTURE_SECONDS="$6"
 
 section() { printf '\n## %s\n' "$1"; }
+TMP_REMOTE=$(mktemp -d /tmp/cluster-ssh-egress.XXXXXX)
+cleanup() { rm -rf "$TMP_REMOTE"; }
+trap cleanup EXIT
 
-section "Input"
-printf 'host=%s\n' "$(hostname)"
-printf 'egress_ip=%s\n' "$EGRESS_IP"
-printf 'destination=%s\n' "${DST:--}"
-printf 'port=%s\n' "${PORT:--}"
-
-section "Local Address Ownership"
-ip -br addr | grep -F "$EGRESS_IP" || echo "Egress IP is not shown in ip addr output."
-
-if [[ -z "$IFACE" ]]; then
-  IFACE=$(ip route get "$EGRESS_IP" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+if sudo -n true >/dev/null 2>&1; then
+  PRIV=(sudo -n)
+else
+  PRIV=()
 fi
-printf 'interface=%s\n' "${IFACE:--}"
 
-section "Route"
-[[ -n "$DST" ]] && ip route get "$DST" || true
-ip route get "$EGRESS_IP" 2>/dev/null || true
+OWNER_IF=$(ip -o -4 addr show 2>/dev/null | awk -v ip="$EGRESS_IP" '$0 ~ ("inet " ip "/") {print $2; exit}')
+ROUTE_LINE=$(ip route get "$DST" 2>/dev/null | head -1 || true)
+ROUTE_IF=$(printf '%s\n' "$ROUTE_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+ROUTE_GW=$(printf '%s\n' "$ROUTE_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+ROUTE_SRC=$(printf '%s\n' "$ROUTE_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+[[ -n "$IFACE_OVERRIDE" ]] && ROUTE_IF="$IFACE_OVERRIDE"
 
-section "Neighbor Entry"
-ip neigh show "$EGRESS_IP" || true
+section "Node and Route Metadata"
+printf 'host=%s\n' "$(hostname)"
+printf 'owner_interface=%s\n' "${OWNER_IF:--}"
+printf 'route_interface=%s\n' "${ROUTE_IF:--}"
+printf 'route_gateway=%s\n' "${ROUTE_GW:--}"
+printf 'route_source=%s\n' "${ROUTE_SRC:--}"
+printf 'egress_ip_present=%s\n' "$([[ -n "$OWNER_IF" ]] && echo true || echo false)"
+printf 'route_line=%s\n' "${ROUTE_LINE:--}"
+ip -br addr 2>/dev/null | grep -F "$EGRESS_IP" || true
 
-section "ARP/Neighbor Probe"
-if [[ -n "$IFACE" && "$EGRESS_IP" != *:* ]] && command -v arping >/dev/null 2>&1; then
-  LOCAL_MAC=$(cat "/sys/class/net/$IFACE/address" 2>/dev/null || true)
-  printf 'local_mac=%s\n' "${LOCAL_MAC:--}"
-  ARP_OUTPUT=$(sudo -n arping -I "$IFACE" -c 5 "$EGRESS_IP" 2>&1 || arping -I "$IFACE" -c 5 "$EGRESS_IP" 2>&1 || true)
+section "Neighbor and Duplicate-IP Probe"
+[[ -n "$ROUTE_IF" ]] && ip neigh show dev "$ROUTE_IF" 2>/dev/null | grep -F "$EGRESS_IP" || true
+if [[ -n "$ROUTE_IF" && "$EGRESS_IP" != *:* ]] && command -v arping >/dev/null 2>&1; then
+  ROUTE_MAC=$(cat "/sys/class/net/$ROUTE_IF/address" 2>/dev/null || true)
+  printf 'route_interface_mac=%s\n' "${ROUTE_MAC:--}"
+  ARP_OUTPUT=$("${PRIV[@]}" arping -I "$ROUTE_IF" -c 5 -w 5 "$EGRESS_IP" 2>&1 || true)
   printf '%s\n' "$ARP_OUTPUT"
   MACS=$(printf '%s\n' "$ARP_OUTPUT" | grep -Eio '([0-9a-f]{2}:){5}[0-9a-f]{2}' | tr '[:upper:]' '[:lower:]' | sort -u || true)
-  MAC_COUNT=$(printf '%s\n' "$MACS" | sed '/^$/d' | wc -l)
-  printf 'unique_response_macs=%s\n' "$MAC_COUNT"
-  if ((MAC_COUNT > 1)); then
-    echo "[CRITICAL] Multiple MAC addresses answered for the same Egress IP. Duplicate ownership is highly likely."
-  elif ((MAC_COUNT == 1)); then
-    echo "[INFO] One MAC answered. Compare it with the expected node/interface MAC and the virtualization or switch MAC table."
-  else
-    echo "[INFO] No ARP response observed. This does not prove the IP is unused when proxy ARP, overlay networking, filtering, or a different L2 domain is involved."
-  fi
+  MAC_COUNT=$(printf '%s\n' "$MACS" | sed '/^$/d' | wc -l | tr -d ' ')
+  printf 'arp_unique_response_macs=%s\n' "$MAC_COUNT"
+  printf 'arp_response_macs=%s\n' "$(printf '%s' "$MACS" | paste -sd, -)"
 else
-  echo "ARP probe skipped: IPv6, interface unavailable, or arping not installed."
+  echo 'arp_probe_status=unavailable'
 fi
 
-section "Destination Connectivity"
-if [[ -n "$DST" && -n "$PORT" ]]; then
-  if command -v nc >/dev/null 2>&1; then
-    nc -vz -w 3 "$DST" "$PORT" 2>&1 || true
-  else
-    timeout 3 bash -c "</dev/tcp/$DST/$PORT" 2>&1 && echo "TCP connect succeeded" || echo "TCP connect failed"
-  fi
-fi
+TCPDUMP_ANY="$TMP_REMOTE/tcpdump-any.log"
+TCPDUMP_EXT="$TMP_REMOTE/tcpdump-external.log"
+CONNTRACK_EVT="$TMP_REMOTE/conntrack-events.log"
 
-section "Conntrack Evidence"
-if [[ -n "$DST" ]] && command -v conntrack >/dev/null 2>&1; then
-  sudo -n conntrack -L 2>/dev/null | grep -E "${EGRESS_IP}|${DST}" | tail -n 100 || true
+section "Capture Capability"
+if command -v tcpdump >/dev/null 2>&1 && [[ -n "$ROUTE_IF" ]]; then
+  echo 'tcpdump_available=true'
+  "${PRIV[@]}" timeout "$CAPTURE_SECONDS" tcpdump -nn -l -i any \
+    "(host $POD_IP or host $EGRESS_IP or host $DST) and port $PORT" >"$TCPDUMP_ANY" 2>&1 &
+  PID_ANY=$!
+  "${PRIV[@]}" timeout "$CAPTURE_SECONDS" tcpdump -nn -l -i "$ROUTE_IF" \
+    "host $DST and port $PORT" >"$TCPDUMP_EXT" 2>&1 &
+  PID_EXT=$!
 else
-  echo "conntrack unavailable or destination not supplied."
+  echo 'tcpdump_available=false'
+  PID_ANY=''
+  PID_EXT=''
 fi
 
-section "Recommended Interpretation"
-cat <<'TEXT'
-- Two or more response MACs for one IP: strong duplicate-IP evidence.
-- One unexpected MAC: identify the owner in vCenter/NSX/switch MAC tables.
-- Egress IP removal followed by continued ARP replies: the address is owned outside the expected Kubernetes path.
-- No ARP reply: continue with route, NAT, conntrack, firewall, and return-path checks; ARP alone is not conclusive across L3/overlay boundaries.
-TEXT
-REMOTE_EGRESS
+if command -v conntrack >/dev/null 2>&1; then
+  echo 'conntrack_available=true'
+  "${PRIV[@]}" timeout "$CAPTURE_SECONDS" conntrack -E -p tcp >"$CONNTRACK_EVT" 2>&1 &
+  PID_CT=$!
+else
+  echo 'conntrack_available=false'
+  PID_CT=''
+fi
+
+echo 'capture_ready=true'
+# Give the caller enough time to observe readiness and generate Pod traffic.
+sleep "$CAPTURE_SECONDS"
+
+[[ -z "$PID_ANY" ]] || wait "$PID_ANY" 2>/dev/null || true
+[[ -z "$PID_EXT" ]] || wait "$PID_EXT" 2>/dev/null || true
+[[ -z "$PID_CT" ]] || wait "$PID_CT" 2>/dev/null || true
+
+section "Tcpdump Any"
+cat "$TCPDUMP_ANY" 2>/dev/null || true
+section "Tcpdump External"
+cat "$TCPDUMP_EXT" 2>/dev/null || true
+section "Conntrack Events"
+grep -E "$POD_IP|$EGRESS_IP|$DST" "$CONNTRACK_EVT" 2>/dev/null | tail -n 200 || true
+section "Conntrack Snapshot"
+if command -v conntrack >/dev/null 2>&1; then
+  "${PRIV[@]}" conntrack -L -p tcp 2>/dev/null | grep -E "$POD_IP|$EGRESS_IP|$DST" | tail -n 200 || true
+fi
+REMOTE_EGRESS_V3
+  local remote_pid=$!
+
+  # Wait until ARP probing has finished and packet capture is ready.
+  local ready=false
+  local wait_i
+  for ((wait_i=0; wait_i<20; wait_i++)); do
+    if grep -q '^capture_ready=true$' "$remote_output" 2>/dev/null; then
+      ready=true
+      break
+    fi
+    if ! kill -0 "$remote_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  if [[ "$ready" != true ]]; then
+    log_error "Remote capture did not become ready on node $TARGET_NODE_NAME."
+    wait "$remote_pid" || true
+    cat "$remote_output" | tee -a "$output_file"
+    rm -rf "$work_dir"
+    return 1
+  fi
+
+  local pod_rc=0
+  set +e
+  "$KUBECTL_BIN" --kubeconfig "$KUBECONFIG_PATH" --request-timeout="$KUBECTL_REQUEST_TIMEOUT" \
+    -n "$namespace" exec "$pod_name" "${exec_container_args[@]}" -- \
+    sh -c '
+      DST="$1"; PORT="$2"; WAIT="$3"
+      echo "test_destination=${DST}:${PORT}"
+      if command -v nc >/dev/null 2>&1; then
+        echo "test_method=nc"
+        nc -vz -w "$WAIT" "$DST" "$PORT"
+      elif command -v curl >/dev/null 2>&1; then
+        echo "test_method=curl-telnet"
+        curl -v --connect-timeout "$WAIT" "telnet://${DST}:${PORT}"
+      elif command -v timeout >/dev/null 2>&1 && command -v bash >/dev/null 2>&1; then
+        echo "test_method=bash-dev-tcp"
+        timeout "$WAIT" bash -c "</dev/tcp/${DST}/${PORT}"
+      else
+        echo "test_method=unavailable"
+        echo "No supported test tool found: nc, curl, or bash+timeout is required." >&2
+        exit 127
+      fi
+    ' sh "$dst" "$port" "$timeout_seconds" >"$pod_output" 2>&1
+  pod_rc=$?
+  set -e
+
+  wait "$remote_pid" || true
+
+  {
+    echo "## Pod Connectivity"
+    cat "$pod_output"
+    echo "pod_test_rc=$pod_rc"
+    echo
+    cat "$remote_output"
+    echo
+    echo "## Automated Verdict"
+  } | tee -a "$output_file"
+
+  local egress_present=false pod_seen=false snat_seen=false synack_seen=false
+  local arp_count="" tcpdump_available=false conntrack_available=false
+  grep -q '^egress_ip_present=true$' "$remote_output" && egress_present=true
+  grep -q '^tcpdump_available=true$' "$remote_output" && tcpdump_available=true
+  grep -q '^conntrack_available=true$' "$remote_output" && conntrack_available=true
+  arp_count=$(awk -F= '/^arp_unique_response_macs=/{print $2; exit}' "$remote_output")
+
+  if grep -E "${pod_ip//./\\.}([.:][0-9]+)?[[:space:]]*>[[:space:]]*${dst//./\\.}[.:]${port}" "$remote_output" >/dev/null 2>&1; then
+    pod_seen=true
+  fi
+  if grep -E "${egress_ip//./\\.}[.:][0-9]+[[:space:]]*>[[:space:]]*${dst//./\\.}[.:]${port}" "$remote_output" >/dev/null 2>&1; then
+    snat_seen=true
+  fi
+  if grep -E "${dst//./\\.}[.:]${port}[[:space:]]*>[[:space:]]*${egress_ip//./\\.}[.:][0-9]+.*Flags[[:space:]]*\[S\.\]" "$remote_output" >/dev/null 2>&1; then
+    synack_seen=true
+  elif grep -E "src=${dst//./\\.}.*dst=${egress_ip//./\\.}" "$remote_output" >/dev/null 2>&1; then
+    synack_seen=true
+  fi
+
+  {
+    [[ "$egress_present" == true ]] && echo "[PASS] Egress IP is present on the selected Egress Node." || echo "[FAIL] Egress IP is not present on the selected Egress Node."
+
+    if [[ -n "$arp_count" && "$arp_count" =~ ^[0-9]+$ && "$arp_count" -gt 1 ]]; then
+      echo "[CRITICAL] Multiple MAC addresses responded for the Egress IP. Duplicate ownership is strongly suspected."
+    elif [[ -n "$arp_count" ]]; then
+      echo "[INFO] ARP response MAC count: $arp_count. ARP alone cannot prove absence of duplication in overlay/proxy-ARP environments."
+    else
+      echo "[WARN] Duplicate-IP ARP evidence was unavailable."
+    fi
+
+    if ((pod_rc == 0)); then
+      echo "[PASS] TCP connectivity from ${namespace}/${pod_name} to ${dst}:${port} succeeded."
+    else
+      echo "[FAIL] TCP connectivity from ${namespace}/${pod_name} to ${dst}:${port} failed (rc=$pod_rc)."
+    fi
+
+    if [[ "$tcpdump_available" == true ]]; then
+      [[ "$pod_seen" == true ]] && echo "[PASS] Pod-originated traffic was observed on the Egress Node." || echo "[WARN] The Pod IP was not observed in tcpdump; local CNI/NAT processing may hide it or traffic may use a different Egress Node."
+      [[ "$snat_seen" == true ]] && echo "[PASS] Outbound traffic with source Egress IP ${egress_ip} was observed." || echo "[FAIL] Expected SNAT source ${egress_ip} was not observed on the external interface."
+      [[ "$synack_seen" == true ]] && echo "[PASS] Return traffic to Egress IP ${egress_ip} was observed." || echo "[WARN] Return traffic to Egress IP ${egress_ip} was not positively identified."
+    else
+      echo "[WARN] tcpdump evidence unavailable; SNAT and return-path verification could not be completed."
+    fi
+
+    [[ "$conntrack_available" == true ]] || echo "[WARN] conntrack evidence unavailable; the CNI may use another dataplane or the command/permission is missing."
+    echo "[INFO] Evidence report: $output_file"
+  } | tee -a "$output_file"
+
+  rm -rf "$work_dir"
+
+  if ((pod_rc != 0)) || [[ "$egress_present" != true ]] || [[ "$snat_seen" != true ]]; then
+    return 2
+  fi
+  if [[ -n "$arp_count" && "$arp_count" =~ ^[0-9]+$ && "$arp_count" -gt 1 ]]; then
+    return 3
+  fi
+  return 0
 }
 
 run_refresh() {

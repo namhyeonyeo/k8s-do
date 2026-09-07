@@ -1,21 +1,21 @@
 # shellcheck shell=bash
 
 _cluster_ssh_completion() {
-  local cur prev words cword
-  _init_completion || return
+  local cur first_arg second_arg cli
+  COMPREPLY=()
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  first_arg="${COMP_WORDS[1]:-}"
+  second_arg="${COMP_WORDS[2]:-}"
+  cli="${CLUSTER_SSH_BIN:-cluster-ssh}"
 
-  local first_arg="${words[1]:-}"
-  local second_arg="${words[2]:-}"
-  local cli="${CLUSTER_SSH_BIN:-cluster-ssh}"
-
-  if [[ $cword -eq 1 ]]; then
+  if [[ $COMP_CWORD -eq 1 ]]; then
     local candidates
     candidates="$($cli __complete clusters 2>/dev/null)"
     COMPREPLY=( $(compgen -W "list nodes check exec doctor egress-check refresh version help --help $candidates" -- "$cur") )
     return
   fi
 
-  if [[ $cword -eq 2 ]]; then
+  if [[ $COMP_CWORD -eq 2 ]]; then
     case "$first_arg" in
       nodes|check|exec|doctor|egress-check|refresh)
         local clusters
@@ -35,7 +35,7 @@ _cluster_ssh_completion() {
     esac
   fi
 
-  if [[ $cword -eq 3 ]]; then
+  if [[ $COMP_CWORD -eq 3 ]]; then
     case "$first_arg" in
       check|exec|doctor|egress-check)
         local nodes
@@ -46,15 +46,14 @@ _cluster_ssh_completion() {
     esac
   fi
 
-  if [[ "$first_arg" == "doctor" ]]; then
-    COMPREPLY=( $(compgen -W "--output" -- "$cur") )
-    return
-  fi
-
-  if [[ "$first_arg" == "egress-check" ]]; then
-    COMPREPLY=( $(compgen -W "--egress-ip --dst --port --iface" -- "$cur") )
-    return
-  fi
+  case "$first_arg" in
+    doctor)
+      COMPREPLY=( $(compgen -W "--output" -- "$cur") )
+      ;;
+    egress-check)
+      COMPREPLY=( $(compgen -W "--egress-ip --dst --port --namespace --pod-prefix --pod --container --iface --timeout --output" -- "$cur") )
+      ;;
+  esac
 }
 
 complete -F _cluster_ssh_completion cluster-ssh
