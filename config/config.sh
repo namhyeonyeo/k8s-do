@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# cluster-ssh v3 configuration
+# k8s-do v3.2 configuration
 # =========================================================
 
-CLUSTER_SSH_USER="vmware-system-user"
+K8S_DO_USER="vmware-system-user"
 KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
 SSH_BIN="${SSH_BIN:-ssh}"
 
@@ -16,10 +16,10 @@ NODE_CACHE_TTL=20
 CLUSTER_CACHE_TTL=30
 ASSET_CACHE_TTL=300
 
-CLUSTER_SSH_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/cluster-ssh"
-CLUSTER_SSH_KNOWN_HOSTS="${XDG_STATE_HOME:-$HOME/.local/state}/cluster-ssh/known_hosts"
+K8S_DO_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/k8s-do"
+K8S_DO_KNOWN_HOSTS="${XDG_STATE_HOME:-$HOME/.local/state}/k8s-do/known_hosts"
 
-CLUSTER_SSH_OPTS=(
+K8S_DO_OPTS=(
   -o IdentitiesOnly=yes
   -o PreferredAuthentications=publickey
   -o PasswordAuthentication=no
@@ -30,10 +30,43 @@ CLUSTER_SSH_OPTS=(
 )
 
 # -----------------------------------------------------------------
-# egress-check v3 defaults
+# Static cluster auto-discovery
 # -----------------------------------------------------------------
-# One Running Pod whose name starts with FIX_TOOL_POD_PREFIX is selected.
-# When more than one Pod matches, use --pod to select one explicitly.
+# Every regular file directly under STATIC_KUBECONFIG_DIR is discovered.
+# The CLI cluster name is derived from the filename:
+#   dev-workload.conf       -> dev-workload
+#   prod-workload.kubeconfig -> prod-workload
+#   stage-workload.yaml     -> stage-workload
+#   test-workload           -> test-workload
+#
+# Recommended convention:
+#   kubeconfig : <cluster-name>.conf (or .kubeconfig/.yaml/.yml/no extension)
+#   private key: <cluster-name>.pem (or .key/no extension)
+#
+# This removes the need to maintain CLUSTERS=(...) and a case statement
+# whenever a new kubeconfig is added.
+STATIC_KUBECONFIG_DIR="/srv/k8s/file/ssh/kubeconfigs"
+STATIC_PRIVATE_KEY_DIR="/srv/k8s/file/ssh/privatekey"
+
+# Optional legacy/fallback mapping.
+# Keep these functions only when a cluster cannot follow the filename convention.
+# get_cluster_kubeconfig() {
+#   case "$1" in
+#     special-cluster) echo "/some/other/path/special.conf" ;;
+#     *) return 1 ;;
+#   esac
+# }
+#
+# get_cluster_private_key() {
+#   case "$1" in
+#     special-cluster) echo "/some/other/path/special.pem" ;;
+#     *) return 1 ;;
+#   esac
+# }
+
+# -----------------------------------------------------------------
+# egress-check defaults
+# -----------------------------------------------------------------
 FIX_TOOL_NAMESPACE="fix-tool"
 FIX_TOOL_POD_PREFIX="fix-tool"
 EGRESS_CHECK_TIMEOUT=10
@@ -52,32 +85,3 @@ SSH_SECRET_KEY="ssh-privatekey"
 declare -A CLUSTER_ALIASES=(
   # [dev-workload]="dev-namespace/tkg-example-dev-workload-cluster-001"
 )
-
-# -----------------------------------------------------------------
-# Static/fallback mode
-# Replace these examples with the files that actually exist.
-# Sandbox example:
-#   kubeconfig : /srv/tanzu/file/ssh/kubeconfigs/dev-workload.conf
-#   private key: /srv/tanzu/file/ssh/privatekey/dev-workload.pem
-# -----------------------------------------------------------------
-CLUSTERS=(
-  dev-workload
-)
-
-get_cluster_kubeconfig() {
-  case "$1" in
-    dev-workload)
-      echo "/srv/tanzu/file/ssh/kubeconfigs/dev-workload.conf"
-      ;;
-    *) return 1 ;;
-  esac
-}
-
-get_cluster_private_key() {
-  case "$1" in
-    dev-workload)
-      echo "/srv/tanzu/file/ssh/privatekey/dev-workload.pem"
-      ;;
-    *) return 1 ;;
-  esac
-}

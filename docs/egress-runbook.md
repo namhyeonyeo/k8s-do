@@ -1,6 +1,6 @@
-# k8s-do v3.2 설치 및 Egress 통합 진단 Runbook
+# k8s-do v3.1 설치 및 Egress 통합 진단 Runbook
 
-## 1. v3.2 변경사항
+## 1. v3.1 변경사항
 
 `egress-check`가 다음 작업을 하나의 명령에서 수행한다.
 
@@ -17,12 +17,12 @@
 
 Node 검사는 SSH, Pod 조회와 통신 발생은 `kubectl exec`를 사용한다.
 
-### Static kubeconfig 자동 탐색 (v3.2)
+### Static kubeconfig 자동 탐색 (v3.1)
 
 기존 v3는 `CLUSTERS=(dev-workload)`와 `get_cluster_kubeconfig()`의 `case`에 클러스터를 직접 등록해야 했다.
 따라서 kubeconfig 디렉터리에 파일이 여러 개 있어도 등록되지 않은 클러스터는 CLI가 알 수 없었다.
 
-v3.2은 아래 두 디렉터리를 기준으로 자동 탐색한다.
+v3.1은 아래 두 디렉터리를 기준으로 자동 탐색한다.
 
 ```bash
 STATIC_KUBECONFIG_DIR="/srv/k8s/file/ssh/kubeconfigs"
@@ -64,7 +64,7 @@ k8s-do __complete clusters
 
 파일 내용에서 Kubernetes Cluster 이름을 추론하는 방식은 kubeconfig의 context/cluster entry 이름이 환경마다 다를 수 있으므로 기본 동작으로 사용하지 않는다. 따라서 **파일명 stem을 CLI의 안정적인 cluster 식별자로 사용하는 것을 권장**한다.
 
-### Node 이름/IP 자동완성 검증 (v3.2)
+### Node 이름/IP 자동완성 검증 (v3.1)
 
 Node completion은 해당 cluster kubeconfig로 다음 정보를 조회한다.
 
@@ -105,17 +105,17 @@ InternalIP가 없는 Node는 Node 이름은 completion에 표시되지만 잘못
 ## 2. 배포 파일
 
 ```text
-k8s-do
-k8s-do.completion
-config.sh
+k8s-do-v3
+k8s-do-v3.completion
+config-v3.sh
 ```
 
 구문 검사:
 
 ```bash
-bash -n k8s-do
-bash -n k8s-do.completion
-bash -n config.sh
+bash -n k8s-do-v3
+bash -n k8s-do-v3.completion
+bash -n config-v3.sh
 ```
 
 ---
@@ -144,9 +144,9 @@ echo "$BACKUP_DIR"
 
 | 운영 경로 | v3 원본 |
 |---|---|
-| `/usr/local/bin/k8s-do` | `k8s-do` |
-| `/etc/bash_completion.d/k8s-do` | `k8s-do.completion` |
-| `/etc/k8s-do/config.sh` | `config.sh`를 환경에 맞게 수정한 파일 |
+| `/usr/local/bin/k8s-do` | `k8s-do-v3` |
+| `/etc/bash_completion.d/k8s-do` | `k8s-do-v3.completion` |
+| `/etc/k8s-do/config.sh` | `config-v3.sh`를 환경에 맞게 수정한 파일 |
 
 실행 파일과 completion은 바로 교체할 수 있다.
 
@@ -156,7 +156,7 @@ echo "$BACKUP_DIR"
 
 ## 5. 샌드박스용 config 확인
 
-제공된 `config.sh`는 다음 샌드박스 구조를 기본 예시로 사용한다.
+제공된 `config-v3.sh`는 다음 샌드박스 구조를 기본 예시로 사용한다.
 
 ```text
 cluster alias: dev-workload
@@ -171,7 +171,7 @@ ls -l /srv/k8s/file/ssh/kubeconfigs/dev-workload.conf
 ls -l /srv/k8s/file/ssh/privatekey/dev-workload.pem
 ```
 
-파일명이 다르면 `config.sh`의 다음 함수를 수정한다.
+파일명이 다르면 `config-v3.sh`의 다음 함수를 수정한다.
 
 ```bash
 get_cluster_kubeconfig()
@@ -195,23 +195,23 @@ install -d -m 750 /etc/k8s-do
 install -d -m 755 /etc/bash_completion.d
 
 install -m 755 \
-  k8s-do \
+  k8s-do-v3 \
   /usr/local/bin/k8s-do
 
 install -m 644 \
-  k8s-do.completion \
+  k8s-do-v3.completion \
   /etc/bash_completion.d/k8s-do
 ```
 
 config는 검토한 뒤 설치한다.
 
 ```bash
-cp config.sh /tmp/config.sh
-vi /tmp/config.sh
-bash -n /tmp/config.sh
+cp config-v3.sh /tmp/config-v3.sh
+vi /tmp/config-v3.sh
+bash -n /tmp/config-v3.sh
 
 install -m 640 \
-  /tmp/config.sh \
+  /tmp/config-v3.sh \
   /etc/k8s-do/config.sh
 ```
 
@@ -219,7 +219,7 @@ install -m 640 \
 
 ## 7. completion 반영
 
-v3.2 completion은 `_init_completion`에 의존하지 않는다.
+v3 completion은 `_init_completion`에 의존하지 않는다.
 
 ```bash
 source /etc/bash_completion.d/k8s-do
@@ -251,7 +251,7 @@ k8s-do __complete nodes dev-workload
 예상 버전:
 
 ```text
-k8s-do 3.2.0
+k8s-do 3.1.0
 ```
 
 fix-tool Pod 확인:

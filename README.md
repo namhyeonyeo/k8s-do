@@ -1,68 +1,63 @@
-# cluster-ssh
+# k8s-do
 
-VMware Tanzu / vSphere Kubernetes Service(VKS) Workload Cluster 노드에
-빠르게 SSH 접속하고, 노드와 Egress 통신을 진단하기 위한 Bash CLI.
+VMware Tanzu / vSphere Kubernetes Service(VKS) Workload Cluster 운영용 Bash CLI.
+노드 SSH 접속, 노드 진단, 원격 명령 실행, Egress 통신 검증을 하나의 명령 체계로 묶었다.
+
+`cluster-ssh`로 시작했지만 기능이 SSH 접속을 넘어섰기 때문에 v3.2에서 `k8s-do`로 이름을 바꿨다.
+
+## 명령
+
+```text
+k8s-do list
+k8s-do nodes <cluster>
+k8s-do <cluster>                       노드 목록에서 대화형 선택 후 SSH
+k8s-do <cluster> <node|ip|index>
+k8s-do check <cluster> <node>
+k8s-do exec <cluster> <node> -- '<remote command>'
+k8s-do doctor <cluster> <node> [--output <file>]
+k8s-do egress-check <cluster> <egress-node> --egress-ip <ip> --dst <ip> --port <port>
+k8s-do refresh [cluster]
+k8s-do version
+```
 
 ## 기능
 
-### v2.0.0
-
-- 노드 목록 출력 후 대화형 선택 (이름 / IP / INDEX)
-- Bash completion이 `cluster-ssh __complete`를 호출해 조회 로직 중복 제거
-- Discovery 모드 3종: `static` / `supervisor` / `hybrid`
-- `doctor`, `check`, `exec` 진단 명령
-- 노드/클러스터 조회 캐시
-
-### v3.0.0
-
-`egress-check`를 실제 운영 장애 분석에 쓸 수 있는 수준으로 재작성했다.
-Egress IP가 "노드에 붙어 있는지"만 보던 것에서, **Pod → Egress Node → 외부**
-경로 전체를 한 명령으로 증거 수집하도록 바꿨다.
-
-한 번의 `egress-check`가 수행하는 작업:
-
-1. 클러스터 kubeconfig 해석
-2. `fix-tool` Namespace에서 Running 테스트 Pod 자동 탐색
-3. Pod 이름 / Pod IP / 배치된 Node 조회
-4. 지정한 Egress Node에 SSH 연결
-5. Egress IP의 로컬 소유 여부, 실제 외부 route interface 확인
-6. route interface에서 ARP 응답 MAC 수집 (IP 충돌 탐지)
-7. Egress Node에서 tcpdump / conntrack 감시 시작
-8. Pod 내부에서 목적지 TCP 연결 실행
-9. Pod 트래픽 / Egress IP SNAT / return traffic 증거 판정
-10. 전체 결과를 로그 파일로 저장
-
-읽기 전용이다. Egress IP 해제, conntrack 삭제, iptables 변경,
-cordon/drain, service restart는 하지 않는다.
-
-Exit code로 판정 결과를 구분한다.
-
-| Code | 의미 |
-|---:|---|
-| 0 | Egress IP 존재, Pod 테스트 성공, SNAT 증거 확인 |
-| 1 | 입력/설정/Pod 탐색/SSH/capture 준비 오류 |
-| 2 | Pod 연결 실패, Egress IP 미소유 또는 SNAT 증거 미확인 |
-| 3 | 복수 ARP MAC 감지 (IP 충돌 의심) |
+- **노드 접근**: 이름 / IP / 목록 INDEX 중 무엇으로도 접속. `fzf`가 있으면 검색형 선택.
+- **Discovery**: `static`(파일 경로 매핑) / `supervisor`(Cluster API + Secret 조회) / `hybrid`
+- **doctor**: Node describe, 배치 Pod, 이벤트, 라우팅/neighbor, 파일시스템·inode·메모리·PSI,
+  kubelet/containerd 상태, kubelet warning, crictl, kernel warning을 한 번에 수집
+- **egress-check**: Pod → Egress Node → 외부 경로를 tcpdump/conntrack 증거로 판정 (읽기 전용)
+- **보안**: private key는 실행 중 임시 디렉터리에만 존재, 전용 known_hosts 사용,
+  `StrictHostKeyChecking=no` 미사용
 
 ## 구성
 
 ```text
-bin/cluster-ssh                   실행 파일
-completion/cluster-ssh.completion Bash completion
-config/config.sh                  환경별 설정 (클러스터 매핑, 경로, fix-tool Pod)
-docs/INSTALL.md                   설치 및 Egress 진단 Runbook
+bin/k8s-do                    실행 파일
+completion/k8s-do.completion  Bash completion
+config/config.sh              클러스터 매핑, 경로, fix-tool Pod 설정
+docs/INSTALL.md               설치 및 Egress 진단 Runbook
+docs/feature-guide.md         전체 기능 정리 및 사용법
+docs/egress-runbook.md        v3.1 기준 Egress 진단 Runbook
+tests/                        동작 검증 스크립트
 ```
 
-## 사용 예
+## 버전 기록
+
+| 버전 | 내용 |
+|---|---|
+| v2.0.0 | 노드 선택 UX, completion 위임, static/supervisor/hybrid discovery |
+| v3.0.0 | egress-check를 Pod→Node→외부 전 경로 증거 수집으로 재작성 |
+| v3.2   | `cluster-ssh` → `k8s-do` 개명, 기본 경로 `/srv/k8s`로 이전, 검증 스크립트 추가 |
+
+## 설치
 
 ```bash
-cluster-ssh list
-cluster-ssh nodes dev-workload
-cluster-ssh dev-workload worker-node-01
-cluster-ssh exec dev-workload worker-node-01 -- 'sudo journalctl -u kubelet -n 100 --no-pager'
-cluster-ssh doctor dev-workload worker-node-01
-cluster-ssh egress-check dev-workload worker-node-01 \
-  --egress-ip 10.60.196.92 --dst 10.60.196.60 --port 22
+sudo install -d -m 750 /etc/k8s-do
+sudo install -m 755 bin/k8s-do /usr/local/bin/k8s-do
+sudo install -m 644 completion/k8s-do.completion /etc/bash_completion.d/k8s-do
+sudo install -m 640 config/config.sh /etc/k8s-do/config.sh
+source /etc/bash_completion.d/k8s-do
 ```
 
-설치와 결과 해석은 [docs/INSTALL.md](docs/INSTALL.md) 참고.
+자세한 내용은 [docs/INSTALL.md](docs/INSTALL.md), [docs/feature-guide.md](docs/feature-guide.md) 참고.

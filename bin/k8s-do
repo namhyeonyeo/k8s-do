@@ -2,19 +2,19 @@
 
 set -Eeuo pipefail
 
-VERSION="3.0.0"
-CONFIG_FILE="${CLUSTER_SSH_CONFIG:-/etc/cluster-ssh/config.sh}"
+VERSION="3.2.0"
+CONFIG_FILE="${K8S_DO_CONFIG:-/etc/k8s-do/config.sh}"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "[ERROR] Config file not found: $CONFIG_FILE" >&2
-  echo "        Set CLUSTER_SSH_CONFIG to the correct config path." >&2
+  echo "        Set K8S_DO_CONFIG to the correct config path." >&2
   exit 1
 fi
 
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
 
-: "${CLUSTER_SSH_USER:=vmware-system-user}"
+: "${K8S_DO_USER:=vmware-system-user}"
 : "${KUBECTL_BIN:=kubectl}"
 : "${SSH_BIN:=ssh}"
 : "${CLUSTER_DISCOVERY_MODE:=static}"
@@ -27,14 +27,16 @@ source "$CONFIG_FILE"
 : "${KUBECONFIG_SECRET_KEY:=value}"
 : "${SSH_SECRET_SUFFIX:=-ssh}"
 : "${SSH_SECRET_KEY:=ssh-privatekey}"
-: "${CLUSTER_SSH_CACHE_DIR:=${XDG_CACHE_HOME:-$HOME/.cache}/cluster-ssh}"
-: "${CLUSTER_SSH_KNOWN_HOSTS:=${XDG_STATE_HOME:-$HOME/.local/state}/cluster-ssh/known_hosts}"
+: "${K8S_DO_CACHE_DIR:=${XDG_CACHE_HOME:-$HOME/.cache}/k8s-do}"
+: "${K8S_DO_KNOWN_HOSTS:=${XDG_STATE_HOME:-$HOME/.local/state}/k8s-do/known_hosts}"
 : "${FIX_TOOL_NAMESPACE:=fix-tool}"
 : "${FIX_TOOL_POD_PREFIX:=fix-tool}"
 : "${EGRESS_CHECK_TIMEOUT:=10}"
+: "${STATIC_KUBECONFIG_DIR:=}"
+: "${STATIC_PRIVATE_KEY_DIR:=}"
 
-if ! declare -p CLUSTER_SSH_OPTS >/dev/null 2>&1; then
-  CLUSTER_SSH_OPTS=(
+if ! declare -p K8S_DO_OPTS >/dev/null 2>&1; then
+  K8S_DO_OPTS=(
     -o IdentitiesOnly=yes
     -o PreferredAuthentications=publickey
     -o PasswordAuthentication=no
@@ -43,11 +45,11 @@ if ! declare -p CLUSTER_SSH_OPTS >/dev/null 2>&1; then
   )
 fi
 
-mkdir -p "$CLUSTER_SSH_CACHE_DIR/nodes" "$CLUSTER_SSH_CACHE_DIR/assets"
-mkdir -p "$(dirname "$CLUSTER_SSH_KNOWN_HOSTS")"
-chmod 700 "$CLUSTER_SSH_CACHE_DIR" "$CLUSTER_SSH_CACHE_DIR/nodes" "$CLUSTER_SSH_CACHE_DIR/assets" 2>/dev/null || true
-touch "$CLUSTER_SSH_KNOWN_HOSTS"
-chmod 600 "$CLUSTER_SSH_KNOWN_HOSTS" 2>/dev/null || true
+mkdir -p "$K8S_DO_CACHE_DIR/nodes" "$K8S_DO_CACHE_DIR/assets"
+mkdir -p "$(dirname "$K8S_DO_KNOWN_HOSTS")"
+chmod 700 "$K8S_DO_CACHE_DIR" "$K8S_DO_CACHE_DIR/nodes" "$K8S_DO_CACHE_DIR/assets" 2>/dev/null || true
+touch "$K8S_DO_KNOWN_HOSTS"
+chmod 600 "$K8S_DO_KNOWN_HOSTS" 2>/dev/null || true
 
 RUNTIME_DIR=""
 CLUSTER_SOURCE=""
@@ -72,21 +74,21 @@ log_error() { printf '[ERROR] %s\n' "$*" >&2; }
 show_usage() {
   cat <<'EOF_USAGE'
 Usage:
-  cluster-ssh list
-  cluster-ssh nodes <cluster>
-  cluster-ssh <cluster>
-  cluster-ssh <cluster> <node-name|node-ip|index>
-  cluster-ssh check <cluster> <node-name|node-ip|index>
-  cluster-ssh exec <cluster> <node-name|node-ip|index> -- '<remote command>'
-  cluster-ssh doctor <cluster> <node-name|node-ip|index> [--output <file>]
-  cluster-ssh egress-check <cluster> <node-name|node-ip|index> \
+  k8s-do list
+  k8s-do nodes <cluster>
+  k8s-do <cluster>
+  k8s-do <cluster> <node-name|node-ip|index>
+  k8s-do check <cluster> <node-name|node-ip|index>
+  k8s-do exec <cluster> <node-name|node-ip|index> -- '<remote command>'
+  k8s-do doctor <cluster> <node-name|node-ip|index> [--output <file>]
+  k8s-do egress-check <cluster> <node-name|node-ip|index> \
       --egress-ip <ip> --dst <ip> --port <port> \
       [--namespace <ns>] [--pod-prefix <prefix>] [--pod <name>] \
       [--container <name>] [--iface <interface>] [--timeout <seconds>] \
       [--output <file>]
-  cluster-ssh refresh [cluster]
-  cluster-ssh version
-  cluster-ssh help
+  k8s-do refresh [cluster]
+  k8s-do version
+  k8s-do help
 
 Cluster formats:
   static mode      : dev-workload
@@ -94,14 +96,14 @@ Cluster formats:
   alias (optional) : dev-workload -> namespace/cluster-name
 
 Examples:
-  cluster-ssh list
-  cluster-ssh nodes dev-workload
-  cluster-ssh dev-workload
-  cluster-ssh dev-workload worker-node-01
-  cluster-ssh dev-workload 2
-  cluster-ssh exec dev-workload worker-node-01 -- 'sudo journalctl -u kubelet -n 100 --no-pager'
-  cluster-ssh doctor dev-workload worker-node-01
-  cluster-ssh egress-check dev-workload worker-node-01 --egress-ip 10.60.93.191 --dst 10.60.191.31 --port 8522
+  k8s-do list
+  k8s-do nodes dev-workload
+  k8s-do dev-workload
+  k8s-do dev-workload worker-node-01
+  k8s-do dev-workload 2
+  k8s-do exec dev-workload worker-node-01 -- 'sudo journalctl -u kubelet -n 100 --no-pager'
+  k8s-do doctor dev-workload worker-node-01
+  k8s-do egress-check dev-workload worker-node-01 --egress-ip 10.60.93.191 --dst 10.60.191.31 --port 8522
 
 Egress check defaults:
   namespace  : fix-tool
@@ -157,10 +159,98 @@ kubectl_supervisor() {
     "$@"
 }
 
-list_static_clusters() {
-  if declare -p CLUSTERS >/dev/null 2>&1; then
-    printf '%s\n' "${CLUSTERS[@]}"
+static_ref_from_filename() {
+  local name
+  name=$(basename "$1")
+  case "$name" in
+    *.kubeconfig) name="${name%.kubeconfig}" ;;
+    *.conf)       name="${name%.conf}" ;;
+    *.yaml)       name="${name%.yaml}" ;;
+    *.yml)        name="${name%.yml}" ;;
+  esac
+  printf '%s\n' "$name"
+}
+
+discover_static_kubeconfigs() {
+  [[ -n "${STATIC_KUBECONFIG_DIR:-}" && -d "$STATIC_KUBECONFIG_DIR" ]] || return 0
+
+  local file ref
+  while IFS= read -r -d '' file; do
+    ref=$(static_ref_from_filename "$file")
+    [[ -n "$ref" ]] && printf '%s\t%s\n' "$ref" "$file"
+  done < <(find "$STATIC_KUBECONFIG_DIR" -maxdepth 1 -type f ! -name '.*' -print0 2>/dev/null | sort -z)
+}
+
+resolve_discovered_kubeconfig() {
+  local cluster="$1"
+  local matches=() ref file
+
+  while IFS=$'\t' read -r ref file; do
+    [[ -n "$ref" ]] || continue
+    if [[ "$cluster" == "$ref" || "$cluster" == "$(basename "$file")" ]]; then
+      matches+=("$file")
+    fi
+  done < <(discover_static_kubeconfigs)
+
+  if ((${#matches[@]} == 1)); then
+    printf '%s\n' "${matches[0]}"
+    return 0
   fi
+
+  if ((${#matches[@]} > 1)); then
+    log_error "Multiple kubeconfig files map to static cluster [$cluster]."
+    printf '        Rename files so each cluster has one unique filename.\n' >&2
+    printf '        - %s\n' "${matches[@]}" >&2
+  fi
+  return 1
+}
+
+resolve_static_kubeconfig() {
+  local cluster="$1"
+
+  if [[ -n "${STATIC_KUBECONFIG_DIR:-}" ]]; then
+    resolve_discovered_kubeconfig "$cluster" && return 0
+  fi
+
+  if declare -F get_cluster_kubeconfig >/dev/null 2>&1; then
+    get_cluster_kubeconfig "$cluster" && return 0
+  fi
+
+  return 1
+}
+
+resolve_static_private_key() {
+  local cluster="$1"
+
+  if [[ -n "${STATIC_PRIVATE_KEY_DIR:-}" && -d "$STATIC_PRIVATE_KEY_DIR" ]]; then
+    local candidate
+    for candidate in \
+      "$STATIC_PRIVATE_KEY_DIR/$cluster" \
+      "$STATIC_PRIVATE_KEY_DIR/$cluster.pem" \
+      "$STATIC_PRIVATE_KEY_DIR/$cluster.key"; do
+      if [[ -f "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+  fi
+
+  if declare -F get_cluster_private_key >/dev/null 2>&1; then
+    get_cluster_private_key "$cluster" && return 0
+  fi
+
+  return 1
+}
+
+list_static_clusters() {
+  {
+    if [[ -n "${STATIC_KUBECONFIG_DIR:-}" ]]; then
+      discover_static_kubeconfigs | cut -f1
+    fi
+    if declare -p CLUSTERS >/dev/null 2>&1; then
+      printf '%s\n' "${CLUSTERS[@]}"
+    fi
+  } | sed '/^$/d' | sort -u
 }
 
 fetch_supervisor_clusters() {
@@ -169,7 +259,7 @@ fetch_supervisor_clusters() {
 }
 
 list_supervisor_clusters_tsv() {
-  local cache_file="$CLUSTER_SSH_CACHE_DIR/clusters.tsv"
+  local cache_file="$K8S_DO_CACHE_DIR/clusters.tsv"
 
   if cache_is_fresh "$cache_file" "$CLUSTER_CACHE_TTL"; then
     cat "$cache_file"
@@ -177,7 +267,7 @@ list_supervisor_clusters_tsv() {
   fi
 
   local tmp
-  tmp=$(mktemp "$CLUSTER_SSH_CACHE_DIR/.clusters.XXXXXX")
+  tmp=$(mktemp "$K8S_DO_CACHE_DIR/.clusters.XXXXXX")
 
   if fetch_supervisor_clusters >"$tmp" 2>/dev/null; then
     chmod 600 "$tmp"
@@ -250,8 +340,7 @@ resolve_alias() {
 
 static_cluster_exists() {
   local cluster="$1"
-  declare -F get_cluster_kubeconfig >/dev/null 2>&1 || return 1
-  get_cluster_kubeconfig "$cluster" >/dev/null 2>&1
+  resolve_static_kubeconfig "$cluster" >/dev/null 2>&1
 }
 
 resolve_supervisor_ref() {
@@ -339,7 +428,10 @@ resolve_cluster_kubeconfig() {
   resolve_cluster "$requested"
 
   if [[ "$CLUSTER_SOURCE" == "static" ]]; then
-    KUBECONFIG_PATH=$(get_cluster_kubeconfig "$CLUSTER_REF") || return 1
+    KUBECONFIG_PATH=$(resolve_static_kubeconfig "$CLUSTER_REF") || {
+      log_error "No kubeconfig mapping for cluster: $CLUSTER_REF"
+      return 1
+    }
     [[ -f "$KUBECONFIG_PATH" ]] || {
       log_error "kubeconfig not found: $KUBECONFIG_PATH"
       return 1
@@ -349,7 +441,7 @@ resolve_cluster_kubeconfig() {
 
   local safe cache_file
   safe=$(safe_cache_name "$CLUSTER_REF")
-  cache_file="$CLUSTER_SSH_CACHE_DIR/assets/${safe}.kubeconfig"
+  cache_file="$K8S_DO_CACHE_DIR/assets/${safe}.kubeconfig"
 
   if ! cache_is_fresh "$cache_file" "$ASSET_CACHE_TTL"; then
     extract_secret_to_file \
@@ -364,7 +456,7 @@ resolve_cluster_kubeconfig() {
 
 resolve_private_key() {
   if [[ "$CLUSTER_SOURCE" == "static" ]]; then
-    PRIVATE_KEY_PATH=$(get_cluster_private_key "$CLUSTER_REF") || {
+    PRIVATE_KEY_PATH=$(resolve_static_private_key "$CLUSTER_REF") || {
       log_error "No private key mapping for cluster: $CLUSTER_REF"
       return 1
     }
@@ -376,7 +468,7 @@ resolve_private_key() {
   fi
 
   if [[ -z "$RUNTIME_DIR" ]]; then
-    RUNTIME_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cluster-ssh.XXXXXX")
+    RUNTIME_DIR=$(mktemp -d "${TMPDIR:-/tmp}/k8s-do.XXXXXX")
     chmod 700 "$RUNTIME_DIR"
   fi
 
@@ -390,7 +482,7 @@ resolve_private_key() {
 
 node_cache_file() {
   local cluster="$1"
-  printf '%s/nodes/%s.tsv\n' "$CLUSTER_SSH_CACHE_DIR" "$(safe_cache_name "$cluster")"
+  printf '%s/nodes/%s.tsv\n' "$K8S_DO_CACHE_DIR" "$(safe_cache_name "$cluster")"
 }
 
 fetch_node_rows() {
@@ -414,7 +506,7 @@ load_node_rows() {
     return 0
   fi
 
-  tmp=$(mktemp "$CLUSTER_SSH_CACHE_DIR/nodes/.nodes.XXXXXX")
+  tmp=$(mktemp "$K8S_DO_CACHE_DIR/nodes/.nodes.XXXXXX")
   if fetch_node_rows >"$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
     chmod 600 "$tmp"
     mv -f "$tmp" "$cache_file"
@@ -512,8 +604,8 @@ select_node_interactively() {
 ssh_base_args() {
   SSH_ARGS=(
     -i "$PRIVATE_KEY_PATH"
-    -o UserKnownHostsFile="$CLUSTER_SSH_KNOWN_HOSTS"
-    "${CLUSTER_SSH_OPTS[@]}"
+    -o UserKnownHostsFile="$K8S_DO_KNOWN_HOSTS"
+    "${K8S_DO_OPTS[@]}"
   )
 }
 
@@ -528,7 +620,7 @@ prepare_connection() {
   TARGET_NODE_NAME="${resolved%%$'\t'*}"
   TARGET_NODE_IP="${resolved#*$'\t'}"
 
-  [[ -n "$TARGET_NODE_IP" ]] || {
+  [[ -n "$TARGET_NODE_IP" && "$TARGET_NODE_IP" != "-" ]] || {
     log_error "Node has no InternalIP: $TARGET_NODE_NAME"
     return 1
   }
@@ -544,10 +636,10 @@ run_ssh() {
   log_info "Cluster : $CLUSTER_REF"
   log_info "Node    : $TARGET_NODE_NAME"
   log_info "IP      : $TARGET_NODE_IP"
-  log_info "User    : $CLUSTER_SSH_USER"
+  log_info "User    : $K8S_DO_USER"
 
   local rc=0
-  if "$SSH_BIN" "${SSH_ARGS[@]}" "${CLUSTER_SSH_USER}@${TARGET_NODE_IP}"; then
+  if "$SSH_BIN" "${SSH_ARGS[@]}" "${K8S_DO_USER}@${TARGET_NODE_IP}"; then
     rc=0
   else
     rc=$?
@@ -568,7 +660,7 @@ run_check() {
 
   local rc=0
   if "$SSH_BIN" "${SSH_ARGS[@]}" -o BatchMode=yes \
-      "${CLUSTER_SSH_USER}@${TARGET_NODE_IP}" 'hostname' >/dev/null; then
+      "${K8S_DO_USER}@${TARGET_NODE_IP}" 'hostname' >/dev/null; then
     printf '[OK] cluster=%s node=%s ip=%s ssh=reachable\n' "$CLUSTER_REF" "$TARGET_NODE_NAME" "$TARGET_NODE_IP"
   else
     rc=$?
@@ -596,7 +688,7 @@ run_exec() {
   printf -v quoted '%q' "$remote_command"
 
   "$SSH_BIN" "${SSH_ARGS[@]}" \
-    "${CLUSTER_SSH_USER}@${TARGET_NODE_IP}" \
+    "${K8S_DO_USER}@${TARGET_NODE_IP}" \
     "bash -lc $quoted"
 }
 
@@ -618,10 +710,10 @@ run_doctor() {
   done
 
   prepare_connection "$cluster" "$target"
-  [[ -n "$output_file" ]] || output_file="cluster-ssh-doctor-$(safe_cache_name "$CLUSTER_REF")-$(safe_cache_name "$TARGET_NODE_NAME")-$(date +%Y%m%d-%H%M%S).log"
+  [[ -n "$output_file" ]] || output_file="k8s-do-doctor-$(safe_cache_name "$CLUSTER_REF")-$(safe_cache_name "$TARGET_NODE_NAME")-$(date +%Y%m%d-%H%M%S).log"
 
   {
-    echo "# cluster-ssh doctor"
+    echo "# k8s-do doctor"
     echo "timestamp=$(date -Is)"
     echo "cluster=$CLUSTER_REF"
     echo "node=$TARGET_NODE_NAME"
@@ -644,7 +736,7 @@ run_doctor() {
     echo
 
     echo "## Remote Node Checks"
-    "$SSH_BIN" "${SSH_ARGS[@]}" "${CLUSTER_SSH_USER}@${TARGET_NODE_IP}" 'bash -s' <<'REMOTE_DOCTOR' 2>&1 || true
+    "$SSH_BIN" "${SSH_ARGS[@]}" "${K8S_DO_USER}@${TARGET_NODE_IP}" 'bash -s' <<'REMOTE_DOCTOR' 2>&1 || true
 set +e
 section() { printf '\n### %s\n' "$1"; }
 
@@ -786,15 +878,15 @@ run_egress_check() {
     exec_container_args=(-c "$container_name")
   fi
 
-  [[ -n "$output_file" ]] || output_file="cluster-ssh-egress-$(safe_cache_name "$CLUSTER_REF")-$(date +%Y%m%d-%H%M%S).log"
+  [[ -n "$output_file" ]] || output_file="k8s-do-egress-$(safe_cache_name "$CLUSTER_REF")-$(date +%Y%m%d-%H%M%S).log"
   local work_dir
-  work_dir=$(mktemp -d "${TMPDIR:-/tmp}/cluster-ssh-egress.XXXXXX")
+  work_dir=$(mktemp -d "${TMPDIR:-/tmp}/k8s-do-egress.XXXXXX")
   chmod 700 "$work_dir"
   local remote_output="$work_dir/remote.log"
   local pod_output="$work_dir/pod.log"
 
   {
-    echo "# cluster-ssh egress-check v3"
+    echo "# k8s-do egress-check v3"
     echo "timestamp=$(date -Is)"
     echo "cluster=$CLUSTER_REF"
     echo "egress_node=$TARGET_NODE_NAME"
@@ -811,7 +903,7 @@ run_egress_check() {
     echo
   } | tee "$output_file"
 
-  "$SSH_BIN" "${SSH_ARGS[@]}" "${CLUSTER_SSH_USER}@${TARGET_NODE_IP}" \
+  "$SSH_BIN" "${SSH_ARGS[@]}" "${K8S_DO_USER}@${TARGET_NODE_IP}" \
     bash -s -- "$egress_ip" "$dst" "$port" "$iface" "$pod_ip" "$capture_seconds" >"$remote_output" 2>&1 <<'REMOTE_EGRESS_V3' &
 set -u
 EGRESS_IP="$1"
@@ -822,7 +914,7 @@ POD_IP="$5"
 CAPTURE_SECONDS="$6"
 
 section() { printf '\n## %s\n' "$1"; }
-TMP_REMOTE=$(mktemp -d /tmp/cluster-ssh-egress.XXXXXX)
+TMP_REMOTE=$(mktemp -d /tmp/k8s-do-egress.XXXXXX)
 cleanup() { rm -rf "$TMP_REMOTE"; }
 trap cleanup EXIT
 
@@ -1033,16 +1125,16 @@ REMOTE_EGRESS_V3
 run_refresh() {
   local requested="${1:-}"
   if [[ -z "$requested" ]]; then
-    rm -rf "$CLUSTER_SSH_CACHE_DIR/nodes" "$CLUSTER_SSH_CACHE_DIR/assets" "$CLUSTER_SSH_CACHE_DIR/clusters.tsv"
-    mkdir -p "$CLUSTER_SSH_CACHE_DIR/nodes" "$CLUSTER_SSH_CACHE_DIR/assets"
-    chmod 700 "$CLUSTER_SSH_CACHE_DIR/nodes" "$CLUSTER_SSH_CACHE_DIR/assets" 2>/dev/null || true
-    log_info "All cluster-ssh caches were cleared."
+    rm -rf "$K8S_DO_CACHE_DIR/nodes" "$K8S_DO_CACHE_DIR/assets" "$K8S_DO_CACHE_DIR/clusters.tsv"
+    mkdir -p "$K8S_DO_CACHE_DIR/nodes" "$K8S_DO_CACHE_DIR/assets"
+    chmod 700 "$K8S_DO_CACHE_DIR/nodes" "$K8S_DO_CACHE_DIR/assets" 2>/dev/null || true
+    log_info "All k8s-do caches were cleared."
     return 0
   fi
 
   resolve_cluster "$requested"
   rm -f "$(node_cache_file "$CLUSTER_REF")"
-  rm -f "$CLUSTER_SSH_CACHE_DIR/assets/$(safe_cache_name "$CLUSTER_REF").kubeconfig"
+  rm -f "$K8S_DO_CACHE_DIR/assets/$(safe_cache_name "$CLUSTER_REF").kubeconfig"
   log_info "Cache cleared for: $CLUSTER_REF"
 }
 
@@ -1064,15 +1156,33 @@ completion_clusters() {
   list_all_cluster_refs
 }
 
-completion_nodes() {
+completion_node_values() {
   local cluster="$1"
   load_node_rows "$cluster" false 2>/dev/null || return 0
   local row name ip ready unsched version
   for row in "${NODE_ROWS[@]}"; do
     IFS=$'\t' read -r name ip ready unsched version <<<"$row"
+    # Bash completion inserts only the node name.
+    # Direct IP input is still supported by resolve_node_target(), but IPs are not
+    # emitted as separate completion candidates because that made the list noisy.
     printf '%s\n' "$name"
-    [[ -n "$ip" ]] && printf '%s\n' "$ip"
   done | sort -u
+}
+
+completion_nodes() {
+  local cluster="$1"
+  load_node_rows "$cluster" false 2>/dev/null || return 0
+  local row name ip ready unsched version status scheduling
+
+  printf '%-55s %-16s %-10s %-12s %s\n' "NODE" "INTERNAL-IP" "STATUS" "SCHEDULING" "VERSION"
+  printf '%-55s %-16s %-10s %-12s %s\n' "----" "-----------" "------" "----------" "-------"
+
+  for row in "${NODE_ROWS[@]}"; do
+    IFS=$'\t' read -r name ip ready unsched version <<<"$row"
+    [[ "$ready" == "True" ]] && status="Ready" || status="NotReady"
+    [[ "$unsched" == "true" ]] && scheduling="Disabled" || scheduling="Enabled"
+    printf '%-55s %-16s %-10s %-12s %s\n'       "$name" "${ip:--}" "$status" "$scheduling" "$version"
+  done
 }
 
 main() {
@@ -1112,7 +1222,7 @@ main() {
       run_refresh "${2:-}"
       ;;
     version)
-      echo "cluster-ssh $VERSION"
+      echo "k8s-do $VERSION"
       ;;
     -h|--help|help)
       show_usage
@@ -1120,7 +1230,10 @@ main() {
     __complete)
       case "${2:-}" in
         clusters) completion_clusters ;;
+        # Human-readable node completion view: one line per Node with InternalIP.
         nodes) [[ -n "${3:-}" ]] && completion_nodes "$3" ;;
+        # Machine-readable values used by Bash completion insertion.
+        node-values) [[ -n "${3:-}" ]] && completion_node_values "$3" ;;
       esac
       ;;
     *)

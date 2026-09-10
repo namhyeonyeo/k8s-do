@@ -1,0 +1,83 @@
+# shellcheck shell=bash
+
+_k8s_do_complete_node_target() {
+  local cli="$1"
+  local cluster="$2"
+  local cur="$3"
+
+  # Bash cannot natively attach a separate description column to a completion
+  # candidate. Therefore this completion does two things:
+  #   1) insert only the node name as the completion value
+  #   2) when Bash asks to list possible candidates, print a readable NODE/IP table
+  if [[ "${K8S_DO_COMPLETION_DETAILS:-1}" == "1" && "${COMP_TYPE:-9}" == "63" ]]; then
+    local table
+    table="$($cli __complete nodes "$cluster" 2>/dev/null || true)"
+    if [[ -n "$table" ]]; then
+      if [[ -w /dev/tty ]]; then
+        printf '\n%s\n' "$table" >/dev/tty
+      else
+        printf '\n%s\n' "$table" >&2
+      fi
+      COMPREPLY=()
+      return
+    fi
+  fi
+
+  local nodes
+  nodes="$($cli __complete node-values "$cluster" 2>/dev/null || true)"
+  COMPREPLY=( $(compgen -W "$nodes" -- "$cur") )
+}
+
+_k8s_do_completion() {
+  local cur first_arg second_arg cli
+  COMPREPLY=()
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  first_arg="${COMP_WORDS[1]:-}"
+  second_arg="${COMP_WORDS[2]:-}"
+  cli="${K8S_DO_BIN:-k8s-do}"
+
+  if [[ $COMP_CWORD -eq 1 ]]; then
+    local candidates
+    candidates="$($cli __complete clusters 2>/dev/null || true)"
+    COMPREPLY=( $(compgen -W "list nodes check exec doctor egress-check refresh version help --help $candidates" -- "$cur") )
+    return
+  fi
+
+  if [[ $COMP_CWORD -eq 2 ]]; then
+    case "$first_arg" in
+      nodes|check|exec|doctor|egress-check|refresh)
+        local clusters
+        clusters="$($cli __complete clusters 2>/dev/null || true)"
+        COMPREPLY=( $(compgen -W "$clusters" -- "$cur") )
+        return
+        ;;
+      list|version|help|--help)
+        return
+        ;;
+      *)
+        _k8s_do_complete_node_target "$cli" "$first_arg" "$cur"
+        return
+        ;;
+    esac
+  fi
+
+  if [[ $COMP_CWORD -eq 3 ]]; then
+    case "$first_arg" in
+      check|exec|doctor|egress-check)
+        _k8s_do_complete_node_target "$cli" "$second_arg" "$cur"
+        return
+        ;;
+    esac
+  fi
+
+  case "$first_arg" in
+    doctor)
+      COMPREPLY=( $(compgen -W "--output" -- "$cur") )
+      ;;
+    egress-check)
+      COMPREPLY=( $(compgen -W "--egress-ip --dst --port --namespace --pod-prefix --pod --container --iface --timeout --output" -- "$cur") )
+      ;;
+  esac
+}
+
+complete -F _k8s_do_completion k8s-do
