@@ -11,7 +11,7 @@ _k8s_do_complete_node_target() {
   #   2) when Bash asks to list possible candidates, print a readable NODE/IP table
   if [[ "${K8S_DO_COMPLETION_DETAILS:-1}" == "1" && "${COMP_TYPE:-9}" == "63" ]]; then
     local table
-    table="$($cli __complete nodes "$cluster" 2>/dev/null || true)"
+    table="$($cli __complete node-table "$cluster" 2>/dev/null || true)"
     if [[ -n "$table" ]]; then
       if [[ -w /dev/tty ]]; then
         printf '\n%s\n' "$table" >/dev/tty

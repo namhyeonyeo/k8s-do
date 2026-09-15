@@ -1,6 +1,6 @@
-# k8s-do v3.2 설치 및 Egress 통합 진단 Runbook
+# k8s-do v3.2.1 설치 및 Egress 통합 진단 Runbook
 
-## 1. v3.2 변경사항
+## 1. v3.2.1 변경사항
 
 `egress-check`가 다음 작업을 하나의 명령에서 수행한다.
 
@@ -17,12 +17,12 @@
 
 Node 검사는 SSH, Pod 조회와 통신 발생은 `kubectl exec`를 사용한다.
 
-### Static kubeconfig 자동 탐색 (v3.2)
+### Static kubeconfig 자동 탐색 (v3.2.1)
 
 기존 v3는 `CLUSTERS=(dev-workload)`와 `get_cluster_kubeconfig()`의 `case`에 클러스터를 직접 등록해야 했다.
 따라서 kubeconfig 디렉터리에 파일이 여러 개 있어도 등록되지 않은 클러스터는 CLI가 알 수 없었다.
 
-v3.2은 아래 두 디렉터리를 기준으로 자동 탐색한다.
+v3.2.1은 아래 두 디렉터리를 기준으로 자동 탐색한다.
 
 ```bash
 STATIC_KUBECONFIG_DIR="/srv/k8s/file/ssh/kubeconfigs"
@@ -64,7 +64,7 @@ k8s-do __complete clusters
 
 파일 내용에서 Kubernetes Cluster 이름을 추론하는 방식은 kubeconfig의 context/cluster entry 이름이 환경마다 다를 수 있으므로 기본 동작으로 사용하지 않는다. 따라서 **파일명 stem을 CLI의 안정적인 cluster 식별자로 사용하는 것을 권장**한다.
 
-### Node 이름/IP 자동완성 검증 (v3.2)
+### Node 이름/IP 자동완성 검증 (v3.2.1)
 
 Node completion은 해당 cluster kubeconfig로 다음 정보를 조회한다.
 
@@ -219,7 +219,7 @@ install -m 640 \
 
 ## 7. completion 반영
 
-v3.2 completion은 `_init_completion`에 의존하지 않는다.
+v3.2.1 completion은 `_init_completion`에 의존하지 않는다.
 
 ```bash
 source /etc/bash_completion.d/k8s-do
@@ -251,7 +251,7 @@ k8s-do __complete nodes dev-workload
 예상 버전:
 
 ```text
-k8s-do 3.2.0
+k8s-do 3.2.1
 ```
 
 fix-tool Pod 확인:
@@ -465,3 +465,23 @@ service restart
 ```
 
 읽기 전용 패킷/상태 수집과 TCP connect 테스트만 수행한다.
+
+## v3.2.1 note: `-kubeconfig` suffix handling
+
+If a static kubeconfig file is named like a Kubernetes Secret, for example:
+
+```text
+tkg-example-prd-workload-cluster-001-kubeconfig
+```
+
+`k8s-do` displays and completes it as:
+
+```text
+tkg-example-prd-workload-cluster-001
+```
+
+The private key lookup also uses the normalized cluster name, so the expected key file is:
+
+```text
+/srv/k8s/file/ssh/privatekey/tkg-example-prd-workload-cluster-001.pem
+```

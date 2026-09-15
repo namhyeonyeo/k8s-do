@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# k8s-do v3.2 configuration
+# k8s-do v3.2.2 configuration
 # =========================================================
 
 K8S_DO_USER="vmware-system-user"

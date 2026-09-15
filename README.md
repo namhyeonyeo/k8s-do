@@ -40,6 +40,8 @@ docs/INSTALL.md               설치 및 Egress 진단 Runbook
 docs/feature-guide.md         전체 기능 정리 및 사용법
 docs/egress-runbook.md        v3.1 기준 Egress 진단 Runbook
 tests/                        동작 검증 스크립트
+docs/releases/                버전별 변경 내역
+install.sh                    설치 스크립트
 ```
 
 ## 버전 기록
@@ -53,11 +55,10 @@ tests/                        동작 검증 스크립트
 ## 설치
 
 ```bash
-sudo install -d -m 750 /etc/k8s-do
-sudo install -m 755 bin/k8s-do /usr/local/bin/k8s-do
-sudo install -m 644 completion/k8s-do.completion /etc/bash_completion.d/k8s-do
-sudo install -m 640 config/config.sh /etc/k8s-do/config.sh
+sudo ./install.sh
 source /etc/bash_completion.d/k8s-do
 ```
+
+기존 `/etc/k8s-do/config.sh`가 있으면 타임스탬프 백업을 남기고 교체한다.
 
 자세한 내용은 [docs/INSTALL.md](docs/INSTALL.md), [docs/feature-guide.md](docs/feature-guide.md) 참고.

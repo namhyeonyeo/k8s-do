@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-VERSION="3.2.0"
+VERSION="3.2.2"
 CONFIG_FILE="${K8S_DO_CONFIG:-/etc/k8s-do/config.sh}"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -162,12 +162,30 @@ kubectl_supervisor() {
 static_ref_from_filename() {
   local name
   name=$(basename "$1")
+
+  # Convert a kubeconfig filename to the logical cluster name shown by completion.
+  # Supported examples:
+  #   dev-workload.conf                         -> dev-workload
+  #   prod-workload.kubeconfig                  -> prod-workload
+  #   stage-workload.yaml                       -> stage-workload
+  #   tkg-xxx-workload-cluster-001-kubeconfig   -> tkg-xxx-workload-cluster-001
+  #
+  # Important: the "*-kubeconfig" form is handled directly, without depending on
+  # config.sh. This prevents completion from exposing cluster names as
+  # "<cluster>-kubeconfig" when kubeconfig files were exported from Secrets.
   case "$name" in
+    *-kubeconfig) name="${name%-kubeconfig}" ;;
     *.kubeconfig) name="${name%.kubeconfig}" ;;
     *.conf)       name="${name%.conf}" ;;
     *.yaml)       name="${name%.yaml}" ;;
     *.yml)        name="${name%.yml}" ;;
   esac
+
+  # Optional fallback for custom suffixes. Keep this after the fixed rules above.
+  if [[ -n "${KUBECONFIG_SECRET_SUFFIX:-}" && "$name" == *"$KUBECONFIG_SECRET_SUFFIX" ]]; then
+    name="${name%$KUBECONFIG_SECRET_SUFFIX}"
+  fi
+
   printf '%s\n' "$name"
 }
 
@@ -227,7 +245,13 @@ resolve_static_private_key() {
     for candidate in \
       "$STATIC_PRIVATE_KEY_DIR/$cluster" \
       "$STATIC_PRIVATE_KEY_DIR/$cluster.pem" \
-      "$STATIC_PRIVATE_KEY_DIR/$cluster.key"; do
+      "$STATIC_PRIVATE_KEY_DIR/$cluster.key" \
+      "$STATIC_PRIVATE_KEY_DIR/$cluster-ssh-privatekey" \
+      "$STATIC_PRIVATE_KEY_DIR/$cluster-ssh-privatekey.pem" \
+      "$STATIC_PRIVATE_KEY_DIR/$cluster-ssh-privatekey.key" \
+      "$STATIC_PRIVATE_KEY_DIR/$cluster-ssh" \
+      "$STATIC_PRIVATE_KEY_DIR/$cluster-ssh.pem" \
+      "$STATIC_PRIVATE_KEY_DIR/$cluster-ssh.key"; do
       if [[ -f "$candidate" ]]; then
         printf '%s\n' "$candidate"
         return 0
@@ -1169,20 +1193,47 @@ completion_node_values() {
   done | sort -u
 }
 
-completion_nodes() {
+completion_nodes_plain() {
   local cluster="$1"
+  [[ -n "$cluster" ]] || return 0
+
   load_node_rows "$cluster" false 2>/dev/null || return 0
-  local row name ip ready unsched version status scheduling
 
-  printf '%-55s %-16s %-10s %-12s %s\n' "NODE" "INTERNAL-IP" "STATUS" "SCHEDULING" "VERSION"
-  printf '%-55s %-16s %-10s %-12s %s\n' "----" "-----------" "------" "----------" "-------"
-
+  local row name ip ready unsched version
   for row in "${NODE_ROWS[@]}"; do
     IFS=$'\t' read -r name ip ready unsched version <<<"$row"
+    [[ -n "$name" && "$name" != "NODE" ]] && printf '%s\n' "$name"
+    # Keep direct IP input supported by resolve_node_target(), but do not insert
+    # IPs from Tab by default. This prevents noisy completion lists and avoids
+    # selecting IPs accidentally.
+    # [[ -n "$ip" && "$ip" != "-" && "$ip" != "INTERNAL-IP" ]] && printf '%s\n' "$ip"
+  done | sort -u
+}
+
+completion_nodes_table() {
+  local cluster="$1"
+  [[ -n "$cluster" ]] || return 0
+
+  load_node_rows "$cluster" false 2>/dev/null || return 0
+
+  local row name ip ready unsched version status scheduling
+  printf '%-5s %-55s %-16s %-10s %-12s %s\n' "INDEX" "NODE" "INTERNAL-IP" "STATUS" "SCHEDULING" "VERSION"
+  printf '%-5s %-55s %-16s %-10s %-12s %s\n' "-----" "----" "-----------" "------" "----------" "-------"
+
+  local i=0
+  for row in "${NODE_ROWS[@]}"; do
+    IFS=$'\t' read -r name ip ready unsched version <<<"$row"
+    ((i += 1))
     [[ "$ready" == "True" ]] && status="Ready" || status="NotReady"
     [[ "$unsched" == "true" ]] && scheduling="Disabled" || scheduling="Enabled"
-    printf '%-55s %-16s %-10s %-12s %s\n'       "$name" "${ip:--}" "$status" "$scheduling" "$version"
+    printf '%-5s %-55s %-16s %-10s %-12s %s\n' \
+      "$i" "$name" "${ip:--}" "$status" "$scheduling" "$version"
   done
+}
+
+# Backward-compatible name. In v3.2.2, __complete nodes is machine-readable.
+completion_nodes() {
+  completion_nodes_plain "$@"
 }
 
 main() {
@@ -1230,10 +1281,11 @@ main() {
     __complete)
       case "${2:-}" in
         clusters) completion_clusters ;;
-        # Human-readable node completion view: one line per Node with InternalIP.
-        nodes) [[ -n "${3:-}" ]] && completion_nodes "$3" ;;
         # Machine-readable values used by Bash completion insertion.
+        nodes) [[ -n "${3:-}" ]] && completion_nodes_plain "$3" ;;
         node-values) [[ -n "${3:-}" ]] && completion_node_values "$3" ;;
+        # Human-readable helper table. The completion wrapper prints this to /dev/tty.
+        node-table) [[ -n "${3:-}" ]] && completion_nodes_table "$3" ;;
       esac
       ;;
     *)
