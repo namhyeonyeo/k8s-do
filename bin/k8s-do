@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-VERSION="3.2.2"
+VERSION="3.2.5"
 CONFIG_FILE="${K8S_DO_CONFIG:-/etc/k8s-do/config.sh}"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -32,6 +32,8 @@ source "$CONFIG_FILE"
 : "${FIX_TOOL_NAMESPACE:=fix-tool}"
 : "${FIX_TOOL_POD_PREFIX:=fix-tool}"
 : "${EGRESS_CHECK_TIMEOUT:=10}"
+: "${K8S_DO_DOCTOR_DIR:=/tmp/k8s-do-doctor}"
+: "${K8S_DO_EGRESS_DIR:=/tmp/k8s-do-egress}"
 : "${STATIC_KUBECONFIG_DIR:=}"
 : "${STATIC_PRIVATE_KEY_DIR:=}"
 
@@ -78,6 +80,7 @@ Usage:
   k8s-do nodes <cluster>
   k8s-do <cluster>
   k8s-do <cluster> <node-name|node-ip|index>
+  k8s-do ssh <cluster> <node-name|node-ip|index>
   k8s-do check <cluster> <node-name|node-ip|index>
   k8s-do exec <cluster> <node-name|node-ip|index> -- '<remote command>'
   k8s-do doctor <cluster> <node-name|node-ip|index> [--output <file>]
@@ -85,7 +88,7 @@ Usage:
       --egress-ip <ip> --dst <ip> --port <port> \
       [--namespace <ns>] [--pod-prefix <prefix>] [--pod <name>] \
       [--container <name>] [--iface <interface>] [--timeout <seconds>] \
-      [--output <file>]
+      [--output <file>] [--verbose]
   k8s-do refresh [cluster]
   k8s-do version
   k8s-do help
@@ -100,6 +103,7 @@ Examples:
   k8s-do nodes dev-workload
   k8s-do dev-workload
   k8s-do dev-workload worker-node-01
+  k8s-do ssh dev-workload worker-node-01
   k8s-do dev-workload 2
   k8s-do exec dev-workload worker-node-01 -- 'sudo journalctl -u kubelet -n 100 --no-pager'
   k8s-do doctor dev-workload worker-node-01
@@ -549,6 +553,23 @@ load_node_rows() {
   return 1
 }
 
+load_node_rows_cache_only() {
+  local requested="$1"
+  [[ -n "$requested" ]] || return 1
+
+  # Completion must never trigger kubectl auth plugins, SSH, sudo, or any
+  # interactive prompt. Resolve the cluster name/path, then read whatever node
+  # cache already exists. Stale cache is acceptable for Tab completion.
+  resolve_cluster_kubeconfig "$requested" >/dev/null 2>&1 || return 1
+
+  local cache_file
+  cache_file=$(node_cache_file "$CLUSTER_REF")
+  [[ -s "$cache_file" ]] || return 1
+
+  mapfile -t NODE_ROWS <"$cache_file"
+  return 0
+}
+
 print_nodes_table() {
   local i=0 name ip ready unsched version scheduling status
 
@@ -734,7 +755,13 @@ run_doctor() {
   done
 
   prepare_connection "$cluster" "$target"
-  [[ -n "$output_file" ]] || output_file="k8s-do-doctor-$(safe_cache_name "$CLUSTER_REF")-$(safe_cache_name "$TARGET_NODE_NAME")-$(date +%Y%m%d-%H%M%S).log"
+  if [[ -z "$output_file" ]]; then
+    mkdir -p "$K8S_DO_DOCTOR_DIR"
+    chmod 700 "$K8S_DO_DOCTOR_DIR" 2>/dev/null || true
+    output_file="$K8S_DO_DOCTOR_DIR/k8s-do-doctor-$(safe_cache_name "$CLUSTER_REF")-$(safe_cache_name "$TARGET_NODE_NAME")-$(date +%Y%m%d-%H%M%S).log"
+  else
+    mkdir -p "$(dirname "$output_file")" 2>/dev/null || true
+  fi
 
   {
     echo "# k8s-do doctor"
@@ -742,6 +769,26 @@ run_doctor() {
     echo "cluster=$CLUSTER_REF"
     echo "node=$TARGET_NODE_NAME"
     echo "ip=$TARGET_NODE_IP"
+    echo
+
+    echo "## Quick Diagnosis Summary"
+    node_ready="$($KUBECTL_BIN --kubeconfig "$KUBECONFIG_PATH" get node "$TARGET_NODE_NAME" -o go-template='{{range .status.conditions}}{{if eq .type "Ready"}}{{.status}}{{"\t"}}{{.reason}}{{"\t"}}{{.message}}{{end}}{{end}}' 2>/dev/null || true)"
+    unsched="$($KUBECTL_BIN --kubeconfig "$KUBECONFIG_PATH" get node "$TARGET_NODE_NAME" -o go-template='{{.spec.unschedulable}}' 2>/dev/null || true)"
+    problem_pods="$($KUBECTL_BIN --kubeconfig "$KUBECONFIG_PATH" get pods -A --field-selector "spec.nodeName=$TARGET_NODE_NAME" --no-headers 2>/dev/null | awk '$4 != "Running" && $4 != "Completed" && $4 != "Succeeded" {c++} END{print c+0}' || true)"
+    warning_events="$($KUBECTL_BIN --kubeconfig "$KUBECONFIG_PATH" get events -A --field-selector "involvedObject.kind=Node,involvedObject.name=$TARGET_NODE_NAME,type=Warning" --no-headers 2>/dev/null | wc -l | tr -d ' ' || true)"
+    printf 'node_ready=%s
+' "${node_ready:-unknown}"
+    printf 'scheduling=%s
+' "$([[ "$unsched" == "true" ]] && echo Disabled || echo Enabled)"
+    printf 'problem_pods_on_node=%s
+' "${problem_pods:-unknown}"
+    printf 'node_warning_events=%s
+' "${warning_events:-unknown}"
+    if [[ "$node_ready" == True* && "${problem_pods:-0}" == "0" ]]; then
+      echo '[INFO] Basic Kubernetes signals look healthy. Review remote sections for OS/kubelet details.'
+    else
+      echo '[WARN] One or more Kubernetes signals need review. Check Node description, pod list, events, and kubelet warnings below.'
+    fi
     echo
 
     echo "## Kubernetes Node"
@@ -832,6 +879,7 @@ run_egress_check() {
   local timeout_seconds="$EGRESS_CHECK_TIMEOUT"
   local capture_seconds=""
   local output_file=""
+  local verbose=false
 
   while (($#)); do
     case "$1" in
@@ -845,6 +893,7 @@ run_egress_check() {
       --container)  container_name="${2:-}"; shift 2 ;;
       --timeout)    timeout_seconds="${2:-}"; shift 2 ;;
       --output)     output_file="${2:-}"; shift 2 ;;
+      --verbose)    verbose=true; shift ;;
       *) log_error "Unknown egress-check option: $1"; return 1 ;;
     esac
   done
@@ -902,7 +951,13 @@ run_egress_check() {
     exec_container_args=(-c "$container_name")
   fi
 
-  [[ -n "$output_file" ]] || output_file="k8s-do-egress-$(safe_cache_name "$CLUSTER_REF")-$(date +%Y%m%d-%H%M%S).log"
+  if [[ -z "$output_file" ]]; then
+    mkdir -p "$K8S_DO_EGRESS_DIR"
+    chmod 700 "$K8S_DO_EGRESS_DIR" 2>/dev/null || true
+    output_file="$K8S_DO_EGRESS_DIR/k8s-do-egress-$(safe_cache_name "$CLUSTER_REF")-$(date +%Y%m%d-%H%M%S).log"
+  else
+    mkdir -p "$(dirname "$output_file")" 2>/dev/null || true
+  fi
   local work_dir
   work_dir=$(mktemp -d "${TMPDIR:-/tmp}/k8s-do-egress.XXXXXX")
   chmod 700 "$work_dir"
@@ -935,7 +990,7 @@ DST="$2"
 PORT="$3"
 IFACE_OVERRIDE="${4:-}"
 POD_IP="$5"
-CAPTURE_SECONDS="$6"
+CAPTURE_SECONDS="${6:-10}"
 
 section() { printf '\n## %s\n' "$1"; }
 TMP_REMOTE=$(mktemp -d /tmp/k8s-do-egress.XXXXXX)
@@ -948,12 +1003,60 @@ else
   PRIV=()
 fi
 
+is_netdev() {
+  [[ -n "${1:-}" && -d "/sys/class/net/$1" ]]
+}
+
+get_route_value() {
+  local key="$1"
+  awk -v key="$key" '{
+    for (i=1; i<=NF; i++) {
+      if ($i == key && (i+1) <= NF) {
+        print $(i+1)
+        exit
+      }
+    }
+  }'
+}
+
 OWNER_IF=$(ip -o -4 addr show 2>/dev/null | awk -v ip="$EGRESS_IP" '$0 ~ ("inet " ip "/") {print $2; exit}')
 ROUTE_LINE=$(ip route get "$DST" 2>/dev/null | head -1 || true)
-ROUTE_IF=$(printf '%s\n' "$ROUTE_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-ROUTE_GW=$(printf '%s\n' "$ROUTE_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
-ROUTE_SRC=$(printf '%s\n' "$ROUTE_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
-[[ -n "$IFACE_OVERRIDE" ]] && ROUTE_IF="$IFACE_OVERRIDE"
+ROUTE_IF=$(printf '%s\n' "$ROUTE_LINE" | get_route_value dev || true)
+ROUTE_GW=$(printf '%s\n' "$ROUTE_LINE" | get_route_value via || true)
+ROUTE_SRC=$(printf '%s\n' "$ROUTE_LINE" | get_route_value src || true)
+
+if ! is_netdev "$ROUTE_IF"; then
+  ROUTE_IF_WARNING="invalid_or_not_found:${ROUTE_IF:-none}"
+  ROUTE_IF=""
+else
+  ROUTE_IF_WARNING=""
+fi
+
+# OWNER_IF is where the Egress IP is assigned, e.g. antrea-egress0.
+# ARP duplicate probing and external tcpdump should use the real L2 egress
+# interface, usually the route interface such as eth0/ens*.  --iface overrides
+# auto-detection when the operator knows the correct interface.
+if [[ -n "$IFACE_OVERRIDE" ]]; then
+  CAPTURE_IF="$IFACE_OVERRIDE"
+  ARP_IF="$IFACE_OVERRIDE"
+else
+  CAPTURE_IF="$ROUTE_IF"
+  ARP_IF="$ROUTE_IF"
+fi
+
+if ! is_netdev "$CAPTURE_IF"; then
+  CAPTURE_IF_WARNING="invalid_or_not_found:${CAPTURE_IF:-none};fallback=any"
+  CAPTURE_IF="any"
+else
+  CAPTURE_IF_WARNING=""
+fi
+
+if ! is_netdev "$ARP_IF"; then
+  ARP_IF_WARNING="invalid_or_not_found:${ARP_IF:-none}"
+  ARP_IF=""
+else
+  ARP_IF_WARNING=""
+fi
 
 section "Node and Route Metadata"
 printf 'host=%s\n' "$(hostname)"
@@ -961,36 +1064,44 @@ printf 'owner_interface=%s\n' "${OWNER_IF:--}"
 printf 'route_interface=%s\n' "${ROUTE_IF:--}"
 printf 'route_gateway=%s\n' "${ROUTE_GW:--}"
 printf 'route_source=%s\n' "${ROUTE_SRC:--}"
+printf 'capture_interface=%s\n' "${CAPTURE_IF:--}"
+printf 'arp_interface=%s\n' "${ARP_IF:--}"
+[[ -z "$ROUTE_IF_WARNING" ]] || printf 'route_interface_warning=%s\n' "$ROUTE_IF_WARNING"
+[[ -z "$CAPTURE_IF_WARNING" ]] || printf 'capture_interface_warning=%s\n' "$CAPTURE_IF_WARNING"
+[[ -z "$ARP_IF_WARNING" ]] || printf 'arp_interface_warning=%s\n' "$ARP_IF_WARNING"
 printf 'egress_ip_present=%s\n' "$([[ -n "$OWNER_IF" ]] && echo true || echo false)"
 printf 'route_line=%s\n' "${ROUTE_LINE:--}"
 ip -br addr 2>/dev/null | grep -F "$EGRESS_IP" || true
 
 section "Neighbor and Duplicate-IP Probe"
-[[ -n "$ROUTE_IF" ]] && ip neigh show dev "$ROUTE_IF" 2>/dev/null | grep -F "$EGRESS_IP" || true
-if [[ -n "$ROUTE_IF" && "$EGRESS_IP" != *:* ]] && command -v arping >/dev/null 2>&1; then
-  ROUTE_MAC=$(cat "/sys/class/net/$ROUTE_IF/address" 2>/dev/null || true)
-  printf 'route_interface_mac=%s\n' "${ROUTE_MAC:--}"
-  ARP_OUTPUT=$("${PRIV[@]}" arping -I "$ROUTE_IF" -c 5 -w 5 "$EGRESS_IP" 2>&1 || true)
+[[ -n "$ARP_IF" ]] && ip neigh show dev "$ARP_IF" 2>/dev/null | grep -F "$EGRESS_IP" || true
+if [[ -n "$ARP_IF" && "$EGRESS_IP" != *:* ]] && command -v arping >/dev/null 2>&1; then
+  ARP_IF_MAC=$(cat "/sys/class/net/$ARP_IF/address" 2>/dev/null || true)
+  printf 'arp_interface_mac=%s\n' "${ARP_IF_MAC:--}"
+  echo 'arp_probe_mode=duplicate-address-detection'
+  echo "arp_probe_command=arping -D -I $ARP_IF -c 5 -w 5 $EGRESS_IP"
+  ARP_OUTPUT=$("${PRIV[@]}" arping -D -I "$ARP_IF" -c 5 -w 5 "$EGRESS_IP" 2>&1 || true)
   printf '%s\n' "$ARP_OUTPUT"
   MACS=$(printf '%s\n' "$ARP_OUTPUT" | grep -Eio '([0-9a-f]{2}:){5}[0-9a-f]{2}' | tr '[:upper:]' '[:lower:]' | sort -u || true)
   MAC_COUNT=$(printf '%s\n' "$MACS" | sed '/^$/d' | wc -l | tr -d ' ')
   printf 'arp_unique_response_macs=%s\n' "$MAC_COUNT"
   printf 'arp_response_macs=%s\n' "$(printf '%s' "$MACS" | paste -sd, -)"
+elif [[ "$EGRESS_IP" == *:* ]]; then
+  echo 'arp_probe_status=skipped_ipv6'
 else
   echo 'arp_probe_status=unavailable'
 fi
-
 TCPDUMP_ANY="$TMP_REMOTE/tcpdump-any.log"
 TCPDUMP_EXT="$TMP_REMOTE/tcpdump-external.log"
 CONNTRACK_EVT="$TMP_REMOTE/conntrack-events.log"
 
 section "Capture Capability"
-if command -v tcpdump >/dev/null 2>&1 && [[ -n "$ROUTE_IF" ]]; then
+if command -v tcpdump >/dev/null 2>&1; then
   echo 'tcpdump_available=true'
   "${PRIV[@]}" timeout "$CAPTURE_SECONDS" tcpdump -nn -l -i any \
     "(host $POD_IP or host $EGRESS_IP or host $DST) and port $PORT" >"$TCPDUMP_ANY" 2>&1 &
   PID_ANY=$!
-  "${PRIV[@]}" timeout "$CAPTURE_SECONDS" tcpdump -nn -l -i "$ROUTE_IF" \
+  "${PRIV[@]}" timeout "$CAPTURE_SECONDS" tcpdump -nn -l -i "$CAPTURE_IF" \
     "host $DST and port $PORT" >"$TCPDUMP_EXT" 2>&1 &
   PID_EXT=$!
 else
@@ -1077,12 +1188,34 @@ REMOTE_EGRESS_V3
 
   wait "$remote_pid" || true
 
+  # Always save the full raw evidence to the report file.  The terminal output is
+  # concise by default so operators can decide quickly.  Use --verbose when the
+  # full tcpdump/conntrack evidence should also be printed to the terminal.
   {
     echo "## Pod Connectivity"
     cat "$pod_output"
     echo "pod_test_rc=$pod_rc"
     echo
+    echo "## Remote Evidence"
     cat "$remote_output"
+  } >>"$output_file"
+
+  {
+    echo "## Pod Connectivity"
+    cat "$pod_output"
+    echo "pod_test_rc=$pod_rc"
+    echo
+    echo "## Key Evidence"
+    grep -E '^(host|owner_interface|route_interface|route_gateway|route_source|capture_interface|arp_interface|egress_ip_present|route_line|arp_probe_mode|arp_probe_command|arp_unique_response_macs|arp_response_macs|tcpdump_available|conntrack_available|capture_ready)=' "$remote_output" || true
+    if [[ "$verbose" == true ]]; then
+      echo
+      echo "## Full Remote Evidence"
+      cat "$remote_output"
+    else
+      echo
+      echo "[INFO] Full tcpdump/conntrack evidence is saved in: $output_file"
+      echo "[INFO] Re-run with --verbose to print full evidence to the terminal."
+    fi
     echo
     echo "## Automated Verdict"
   } | tee -a "$output_file"
@@ -1109,10 +1242,12 @@ REMOTE_EGRESS_V3
   {
     [[ "$egress_present" == true ]] && echo "[PASS] Egress IP is present on the selected Egress Node." || echo "[FAIL] Egress IP is not present on the selected Egress Node."
 
-    if [[ -n "$arp_count" && "$arp_count" =~ ^[0-9]+$ && "$arp_count" -gt 1 ]]; then
-      echo "[CRITICAL] Multiple MAC addresses responded for the Egress IP. Duplicate ownership is strongly suspected."
+    if [[ -n "$arp_count" && "$arp_count" =~ ^[0-9]+$ && "$arp_count" -ge 1 ]]; then
+      echo "[CRITICAL] ARP DAD probe received response MAC(s) for the Egress IP. Duplicate ownership or proxy-ARP response is strongly suspected."
+    elif [[ -n "$arp_count" && "$arp_count" =~ ^[0-9]+$ && "$arp_count" -eq 0 ]]; then
+      echo "[INFO] ARP DAD duplicate probe received 0 response MACs. No duplicate ARP evidence was observed, but ARP alone cannot prove absence of duplication in overlay/proxy-ARP environments."
     elif [[ -n "$arp_count" ]]; then
-      echo "[INFO] ARP response MAC count: $arp_count. ARP alone cannot prove absence of duplication in overlay/proxy-ARP environments."
+      echo "[WARN] ARP duplicate probe result could not be classified cleanly: arp_unique_response_macs=$arp_count"
     else
       echo "[WARN] Duplicate-IP ARP evidence was unavailable."
     fi
@@ -1140,7 +1275,7 @@ REMOTE_EGRESS_V3
   if ((pod_rc != 0)) || [[ "$egress_present" != true ]] || [[ "$snat_seen" != true ]]; then
     return 2
   fi
-  if [[ -n "$arp_count" && "$arp_count" =~ ^[0-9]+$ && "$arp_count" -gt 1 ]]; then
+  if [[ -n "$arp_count" && "$arp_count" =~ ^[0-9]+$ && "$arp_count" -ge 1 ]]; then
     return 3
   fi
   return 0
@@ -1182,14 +1317,15 @@ completion_clusters() {
 
 completion_node_values() {
   local cluster="$1"
-  load_node_rows "$cluster" false 2>/dev/null || return 0
+  load_node_rows_cache_only "$cluster" 2>/dev/null || return 0
   local row name ip ready unsched version
   for row in "${NODE_ROWS[@]}"; do
     IFS=$'\t' read -r name ip ready unsched version <<<"$row"
-    # Bash completion inserts only the node name.
+    # Bash completion inserts only node names by default.
     # Direct IP input is still supported by resolve_node_target(), but IPs are not
-    # emitted as separate completion candidates because that made the list noisy.
-    printf '%s\n' "$name"
+    # emitted as separate completion candidates because long node names and IPs
+    # mixed together make completion noisy.
+    [[ -n "$name" ]] && printf '%s\n' "$name"
   done | sort -u
 }
 
@@ -1197,16 +1333,12 @@ completion_nodes_plain() {
   local cluster="$1"
   [[ -n "$cluster" ]] || return 0
 
-  load_node_rows "$cluster" false 2>/dev/null || return 0
+  load_node_rows_cache_only "$cluster" 2>/dev/null || return 0
 
   local row name ip ready unsched version
   for row in "${NODE_ROWS[@]}"; do
     IFS=$'\t' read -r name ip ready unsched version <<<"$row"
     [[ -n "$name" && "$name" != "NODE" ]] && printf '%s\n' "$name"
-    # Keep direct IP input supported by resolve_node_target(), but do not insert
-    # IPs from Tab by default. This prevents noisy completion lists and avoids
-    # selecting IPs accidentally.
-    # [[ -n "$ip" && "$ip" != "-" && "$ip" != "INTERNAL-IP" ]] && printf '%s\n' "$ip"
   done | sort -u
 }
 
@@ -1251,6 +1383,10 @@ main() {
     nodes)
       (($# == 2)) || { show_usage; return 1; }
       run_nodes "$2"
+      ;;
+    ssh)
+      (($# == 3)) || { show_usage; return 1; }
+      run_ssh "$2" "$3"
       ;;
     check)
       (($# == 3)) || { show_usage; return 1; }

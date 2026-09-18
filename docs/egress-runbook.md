@@ -465,3 +465,8 @@ service restart
 ```
 
 읽기 전용 패킷/상태 수집과 TCP connect 테스트만 수행한다.
+
+
+## v3.2.4 completion behavior note
+
+Bash Tab completion is intentionally non-interactive. It does not print the node table and it does not call kubectl when node cache is missing or stale. Run `k8s-do nodes <cluster>` once to refresh the node cache, then use Tab completion for node names. This prevents kubeconfig auth plugins, SSH prompts, or employee-number prompts from appearing during Tab completion.

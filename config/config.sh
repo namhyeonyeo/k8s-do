@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# k8s-do v3.2.2 configuration
+# k8s-do v3.2.5 configuration
 # =========================================================
 
 K8S_DO_USER="vmware-system-user"
@@ -70,6 +70,8 @@ STATIC_PRIVATE_KEY_DIR="/srv/k8s/file/ssh/privatekey"
 FIX_TOOL_NAMESPACE="fix-tool"
 FIX_TOOL_POD_PREFIX="fix-tool"
 EGRESS_CHECK_TIMEOUT=10
+K8S_DO_DOCTOR_DIR="/tmp/k8s-do-doctor"
+K8S_DO_EGRESS_DIR="/tmp/k8s-do-egress"
 
 # -----------------------------------------------------------------
 # Supervisor API discovery mode

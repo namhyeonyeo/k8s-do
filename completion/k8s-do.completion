@@ -1,30 +1,15 @@
 # shellcheck shell=bash
+# k8s-do v3.2.5 bash completion
+# Completion must be non-interactive: no kubectl, no SSH, no table output.
+# Node completion reads cache only through: k8s-do __complete node-values <cluster>
 
 _k8s_do_complete_node_target() {
   local cli="$1"
   local cluster="$2"
   local cur="$3"
-
-  # Bash cannot natively attach a separate description column to a completion
-  # candidate. Therefore this completion does two things:
-  #   1) insert only the node name as the completion value
-  #   2) when Bash asks to list possible candidates, print a readable NODE/IP table
-  if [[ "${K8S_DO_COMPLETION_DETAILS:-1}" == "1" && "${COMP_TYPE:-9}" == "63" ]]; then
-    local table
-    table="$($cli __complete node-table "$cluster" 2>/dev/null || true)"
-    if [[ -n "$table" ]]; then
-      if [[ -w /dev/tty ]]; then
-        printf '\n%s\n' "$table" >/dev/tty
-      else
-        printf '\n%s\n' "$table" >&2
-      fi
-      COMPREPLY=()
-      return
-    fi
-  fi
-
   local nodes
-  nodes="$($cli __complete node-values "$cluster" 2>/dev/null || true)"
+
+  nodes="$(K8S_DO_COMPLETION=1 "$cli" __complete node-values "$cluster" 2>/dev/null || true)"
   COMPREPLY=( $(compgen -W "$nodes" -- "$cur") )
 }
 
@@ -38,34 +23,35 @@ _k8s_do_completion() {
 
   if [[ $COMP_CWORD -eq 1 ]]; then
     local candidates
-    candidates="$($cli __complete clusters 2>/dev/null || true)"
-    COMPREPLY=( $(compgen -W "list nodes check exec doctor egress-check refresh version help --help $candidates" -- "$cur") )
-    return
+    candidates="$(K8S_DO_COMPLETION=1 "$cli" __complete clusters 2>/dev/null || true)"
+    COMPREPLY=( $(compgen -W "ssh list nodes check exec doctor egress-check refresh version help --help $candidates" -- "$cur") )
+    return 0
   fi
 
   if [[ $COMP_CWORD -eq 2 ]]; then
     case "$first_arg" in
-      nodes|check|exec|doctor|egress-check|refresh)
+      ssh|nodes|check|exec|doctor|egress-check|refresh)
         local clusters
-        clusters="$($cli __complete clusters 2>/dev/null || true)"
+        clusters="$(K8S_DO_COMPLETION=1 "$cli" __complete clusters 2>/dev/null || true)"
         COMPREPLY=( $(compgen -W "$clusters" -- "$cur") )
-        return
+        return 0
         ;;
       list|version|help|--help)
-        return
+        return 0
         ;;
       *)
+        # Backward-compatible form: k8s-do <cluster> <node>
         _k8s_do_complete_node_target "$cli" "$first_arg" "$cur"
-        return
+        return 0
         ;;
     esac
   fi
 
   if [[ $COMP_CWORD -eq 3 ]]; then
     case "$first_arg" in
-      check|exec|doctor|egress-check)
+      ssh|check|exec|doctor|egress-check)
         _k8s_do_complete_node_target "$cli" "$second_arg" "$cur"
-        return
+        return 0
         ;;
     esac
   fi
@@ -75,7 +61,7 @@ _k8s_do_completion() {
       COMPREPLY=( $(compgen -W "--output" -- "$cur") )
       ;;
     egress-check)
-      COMPREPLY=( $(compgen -W "--egress-ip --dst --port --namespace --pod-prefix --pod --container --iface --timeout --output" -- "$cur") )
+      COMPREPLY=( $(compgen -W "--egress-ip --dst --port --namespace --pod-prefix --pod --container --iface --timeout --output --verbose" -- "$cur") )
       ;;
   esac
 }

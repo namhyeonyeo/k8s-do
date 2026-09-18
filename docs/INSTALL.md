@@ -485,3 +485,20 @@ The private key lookup also uses the normalized cluster name, so the expected ke
 ```text
 /srv/k8s/file/ssh/privatekey/tkg-example-prd-workload-cluster-001.pem
 ```
+
+
+## v3.2.4 completion behavior note
+
+Bash Tab completion is intentionally non-interactive. It does not print the node table and it does not call kubectl when node cache is missing or stale. Run `k8s-do nodes <cluster>` once to refresh the node cache, then use Tab completion for node names. This prevents kubeconfig auth plugins, SSH prompts, or employee-number prompts from appearing during Tab completion.
+
+---
+
+## v3.2.5 운영 주의사항
+
+- SSH 접속은 명확하게 `k8s-do ssh <cluster> <node>` 사용을 권장합니다. 기존 `k8s-do <cluster> <node>`도 호환됩니다.
+- Tab 자동완성은 `/root/.cache/k8s-do/nodes` 또는 `${XDG_CACHE_HOME:-$HOME/.cache}/k8s-do/nodes` 아래 node cache만 읽습니다.
+- 자동완성 중 `kubectl`, SSH, sudo, 인증 플러그인을 실행하지 않습니다.
+- node cache가 없으면 먼저 `k8s-do nodes <cluster>`를 실행해 cache를 생성하세요.
+- doctor 기본 결과는 `/tmp/k8s-do-doctor` 아래에 저장됩니다.
+- egress-check 기본 결과는 `/tmp/k8s-do-egress` 아래에 저장됩니다.
+- egress-check는 기본적으로 요약만 터미널에 출력하고, 전체 tcpdump/conntrack 원문은 report 파일에 저장합니다. 터미널에도 전체 원문이 필요하면 `--verbose`를 사용하세요.

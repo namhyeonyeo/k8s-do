@@ -25,6 +25,6 @@ chmod 700 /srv/k8s/file/ssh/privatekey 2>/dev/null || true
 
 hash -r 2>/dev/null || true
 
-echo "[OK] Installed k8s-do v3.2.2"
+echo "[OK] Installed k8s-do v3.2.5"
 echo "Run: source $COMPLETION_PATH"
 echo "Check: k8s-do version && k8s-do __complete clusters"
